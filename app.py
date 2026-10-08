@@ -326,7 +326,7 @@ LAYOUT = r"""
     {% endwith %}
     {% block content %}{% endblock %}
     <footer>
-      SZPT Monitor · Актобе · API ows.goszakup.gov.kz · эталон Stat.gov.kz
+      SZPT Monitor · Актобе 
     </footer>
   </div>
 </body>
@@ -335,18 +335,7 @@ LAYOUT = r"""
 
 INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
-<div class="pills">
-  <div class="pill {{ 'ok' if has_token else 'warn' }}">
-    Токен OWS: <strong>{{ 'подключён' if has_token else 'нет — укажите в .env' }}</strong>
-  </div>
-  <div class="pill {{ 'ok' if etalon_count else 'warn' }}">
-    Эталон: <strong>{{ etalon_count }} файл(ов)</strong>
-  </div>
-  <div class="pill {{ 'ok' if results_count else 'warn' }}">
-    В базе: <strong>{{ results_count }} объявлений</strong>
-    {% if updated_at %}· {{ updated_at }}{% endif %}
-  </div>
-</div>
+
 
 <div class="grid grid-2">
   <div class="card">
@@ -374,7 +363,7 @@ INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
   <div class="card">
     <h2><span class="num">2</span> Письма ДЭР</h2>
     <p style="color:var(--muted);font-size:.85rem;margin-bottom:.5rem;">
-      Официальные письма RU/KZ в УЗ и УО + таблица-приложение (>=15%).
+      Официальные письма RU/KZ в УЗ и УО по завышениям, превышающим порог.
     </p>
     <form method="post" action="{{ url_for('letters') }}">
       <div class="row">
