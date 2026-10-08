@@ -135,5 +135,6 @@ def main():
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"JSON для сайта: {json_path}")
     print("Готово.")
+    
 if __name__ == "__main__":
     main()
