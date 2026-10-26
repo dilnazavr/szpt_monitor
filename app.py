@@ -40,6 +40,9 @@ app.secret_key = "szpt-monitor-aktobe-2026"
 RESULTS_JSON = OUTPUT_DIR / "last_results.json"
 BASE = Path(__file__).resolve().parent
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _list_files(folder: Path, pattern: str = "*") -> List[str]:
     if not folder.exists():
@@ -55,6 +58,7 @@ def _load_results() -> List[Dict[str, Any]]:
             return data.get("rows") or []
         except Exception:
             pass
+    # fallback: последний xlsx
     xlsx_files = sorted(OUTPUT_DIR.glob("zavysheniya_*.xlsx"), reverse=True)
     if not xlsx_files:
         xlsx_files = sorted(OUTPUT_DIR.glob("*.xlsx"), reverse=True)
@@ -63,14 +67,18 @@ def _load_results() -> List[Dict[str, Any]]:
     try:
         df = pd.read_excel(xlsx_files[0])
         colmap = {
-            "Год": "year", "Дата": "date", "Товар": "product",
+            "Год": "year", "Дата": "date", "Период эталона": "etalon_period",
+            "Товар": "product",
             "Предмет лота": "lot_name", "Цена за ед.": "unit_price",
             "Эталон Актобе": "etalon", "% отклонения": "percent",
-            "Сумма": "amount", "Количество": "qty",
+            "Сумма": "amount", "Сумма по договору": "amount",
+            "Сумма по цене СЗПТ": "amount_szpt", "Разница": "difference",
+            "Количество": "qty",
             "Заказчик": "customer", "БИН заказчика": "customer_bin",
+            "Поставщик": "supplier_name", "БИН поставщика": "supplier_biin",
             "Номер лота": "lot_number", "Номер объявления": "number_anno",
             "Номер договора": "contract_number", "Статус": "status",
-            "БИН поставщика": "supplier_biin", "ID лота": "lot_id",
+            "ID лота": "lot_id", "Ссылка": "lot_url",
         }
         df = df.rename(columns={k: v for k, v in colmap.items() if k in df.columns})
         return df.to_dict(orient="records")
@@ -109,6 +117,10 @@ def _etalon_count() -> int:
     return len(list(ETALON_DIR.glob("*.xlsx"))) + len(list(ETALON_DIR.glob("*.xls")))
 
 
+# ---------------------------------------------------------------------------
+# Layout / CSS
+# ---------------------------------------------------------------------------
+
 LAYOUT = r"""
 <!doctype html>
 <html lang="ru">
@@ -130,6 +142,7 @@ LAYOUT = r"""
       --ok: #34d399;
       --warn: #fbbf24;
       --err: #f87171;
+      --danger: #ef4444;
       --radius: 14px;
       --shadow: 0 8px 32px rgba(0,0,0,.35);
     }
@@ -141,6 +154,7 @@ LAYOUT = r"""
       min-height: 100vh;
       line-height: 1.55;
     }
+    /* subtle gradient bg */
     body::before {
       content: "";
       position: fixed;
@@ -152,101 +166,195 @@ LAYOUT = r"""
       z-index: 0;
     }
     .shell { position: relative; z-index: 1; max-width: 1200px; margin: 0 auto; padding: 0 1.25rem 3rem; }
+
+    /* NAV */
     nav {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 1.1rem 0; border-bottom: 1px solid var(--border);
-      margin-bottom: 1.75rem; flex-wrap: wrap; gap: .75rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.1rem 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 1.75rem;
+      flex-wrap: wrap;
+      gap: .75rem;
     }
     .brand {
-      display: flex; align-items: center; gap: .65rem;
-      text-decoration: none; color: var(--text); font-weight: 700; font-size: 1.15rem;
+      display: flex;
+      align-items: center;
+      gap: .65rem;
+      text-decoration: none;
+      color: var(--text);
+      font-weight: 700;
+      font-size: 1.15rem;
     }
     .brand .logo {
       width: 36px; height: 36px;
       background: linear-gradient(135deg, #3b82f6, #10b981);
-      border-radius: 10px; display: grid; place-items: center; font-size: 1rem;
+      border-radius: 10px;
+      display: grid; place-items: center;
+      font-size: 1rem;
     }
     .nav-links { display: flex; gap: .35rem; flex-wrap: wrap; }
     .nav-links a {
-      color: var(--muted); text-decoration: none; padding: .45rem .85rem;
-      border-radius: 8px; font-size: .9rem; font-weight: 500; transition: .15s;
+      color: var(--muted);
+      text-decoration: none;
+      padding: .45rem .85rem;
+      border-radius: 8px;
+      font-size: .9rem;
+      font-weight: 500;
+      transition: .15s;
     }
-    .nav-links a:hover, .nav-links a.active { background: var(--card); color: var(--text); }
+    .nav-links a:hover, .nav-links a.active {
+      background: var(--card);
+      color: var(--text);
+    }
     .nav-links a.active { color: var(--accent2); }
+
+    /* STATUS PILLS */
     .pills { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 1.5rem; }
     .pill {
-      background: var(--card); border: 1px solid var(--border); border-radius: 999px;
-      padding: .35rem .9rem; font-size: .8rem; color: var(--muted);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: .35rem .9rem;
+      font-size: .8rem;
+      color: var(--muted);
     }
     .pill strong { color: var(--text); }
     .pill.ok strong { color: var(--ok); }
     .pill.warn strong { color: var(--warn); }
+
+    /* CARDS */
     .grid { display: grid; gap: 1.15rem; }
     @media (min-width: 800px) {
       .grid-2 { grid-template-columns: 1fr 1fr; }
+      .grid-3 { grid-template-columns: repeat(3, 1fr); }
     }
     .card {
-      background: var(--card); border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 1.35rem 1.5rem; box-shadow: var(--shadow);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.35rem 1.5rem;
+      box-shadow: var(--shadow);
     }
     .card h2 {
-      font-size: 1.05rem; font-weight: 650; margin-bottom: 1rem;
-      display: flex; align-items: center; gap: .55rem;
+      font-size: 1.05rem;
+      font-weight: 650;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      gap: .55rem;
     }
     .card h2 .num {
       width: 26px; height: 26px;
       background: linear-gradient(135deg, #3b82f6, #2563eb);
-      border-radius: 8px; display: grid; place-items: center;
-      font-size: .8rem; font-weight: 700; color: #fff;
+      border-radius: 8px;
+      display: grid; place-items: center;
+      font-size: .8rem;
+      font-weight: 700;
+      color: #fff;
     }
+
     label {
-      display: block; font-size: .8rem; color: var(--muted);
-      margin: .7rem 0 .25rem; font-weight: 500;
+      display: block;
+      font-size: .8rem;
+      color: var(--muted);
+      margin: .7rem 0 .25rem;
+      font-weight: 500;
     }
     input, select {
-      width: 100%; padding: .55rem .75rem; border-radius: 9px;
-      border: 1px solid var(--border); background: var(--bg2);
-      color: var(--text); font-size: .95rem;
+      width: 100%;
+      padding: .55rem .75rem;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--bg2);
+      color: var(--text);
+      font-size: .95rem;
     }
     input:focus, select:focus {
-      outline: none; border-color: var(--accent);
+      outline: none;
+      border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(59,130,246,.22);
     }
     .row { display: flex; gap: .85rem; flex-wrap: wrap; }
     .row > * { flex: 1; min-width: 110px; }
+
     button, .btn {
-      display: inline-flex; align-items: center; justify-content: center; gap: .4rem;
-      margin-top: 1rem; width: 100%; padding: .7rem 1rem; border: none; border-radius: 9px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: .4rem;
+      margin-top: 1rem;
+      width: 100%;
+      padding: .7rem 1rem;
+      border: none;
+      border-radius: 9px;
       background: linear-gradient(135deg, #3b82f6, #2563eb);
-      color: #fff; font-size: .95rem; font-weight: 600; cursor: pointer;
-      text-decoration: none; transition: .15s;
+      color: #fff;
+      font-size: .95rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: .15s;
     }
     button:hover, .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
     .btn-sm { width: auto; margin-top: 0; padding: .4rem .75rem; font-size: .82rem; }
     .btn-ghost {
-      background: transparent; border: 1px solid var(--border); color: var(--muted);
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--muted);
     }
     .btn-ghost:hover { border-color: var(--accent); color: var(--text); filter: none; }
     .btn-ok { background: linear-gradient(135deg, #10b981, #059669); }
+    .btn-warn { background: linear-gradient(135deg, #f59e0b, #d97706); }
+
+    /* FLASH */
     .flash {
-      padding: .85rem 1.1rem; border-radius: 10px; margin-bottom: 1.15rem;
-      font-size: .9rem; white-space: pre-wrap;
+      padding: .85rem 1.1rem;
+      border-radius: 10px;
+      margin-bottom: 1.15rem;
+      font-size: .9rem;
+      white-space: pre-wrap;
     }
     .flash.ok { background: rgba(52,211,153,.12); border: 1px solid rgba(52,211,153,.35); color: #6ee7b7; }
     .flash.err { background: rgba(248,113,113,.12); border: 1px solid rgba(248,113,113,.35); color: #fca5a5; }
+
+    /* TABLE */
     .table-wrap {
-      overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); background: var(--card);
+      overflow-x: auto;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--card);
     }
-    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .85rem;
+    }
     th {
-      text-align: left; padding: .75rem 1rem; background: var(--card2);
-      color: var(--muted); font-weight: 600; font-size: .75rem;
-      text-transform: uppercase; letter-spacing: .03em; white-space: nowrap;
+      text-align: left;
+      padding: .75rem 1rem;
+      background: var(--card2);
+      color: var(--muted);
+      font-weight: 600;
+      font-size: .75rem;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+      white-space: nowrap;
+      position: sticky;
+      top: 0;
     }
-    td { padding: .7rem 1rem; border-top: 1px solid var(--border); vertical-align: top; }
+    td {
+      padding: .7rem 1rem;
+      border-top: 1px solid var(--border);
+      vertical-align: top;
+    }
     tr:hover td { background: rgba(59,130,246,.06); }
     .pct {
-      font-weight: 700; padding: .15rem .45rem; border-radius: 6px; font-size: .82rem;
+      font-weight: 700;
+      padding: .15rem .45rem;
+      border-radius: 6px;
+      font-size: .82rem;
     }
     .pct.high { background: rgba(239,68,68,.2); color: #fca5a5; }
     .pct.mid { background: rgba(251,191,36,.18); color: #fcd34d; }
@@ -254,53 +362,95 @@ LAYOUT = r"""
     .mono { font-family: ui-monospace, monospace; font-size: .8rem; color: var(--muted); }
     .lot-name { max-width: 280px; }
     .customer { max-width: 200px; }
+
+    /* FILTERS */
     .filters {
-      display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 1rem; align-items: flex-end;
+      display: flex;
+      flex-wrap: wrap;
+      gap: .75rem;
+      margin-bottom: 1rem;
+      align-items: flex-end;
     }
     .filters .field { min-width: 140px; flex: 1; }
     .filters label { margin-top: 0; }
     .filters button { margin-top: 0; width: auto; padding: .55rem 1.1rem; }
+
+    /* STATS */
     .stat-grid {
-      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: .85rem; margin-bottom: 1.35rem;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: .85rem;
+      margin-bottom: 1.35rem;
     }
     .stat {
-      background: var(--card); border: 1px solid var(--border);
-      border-radius: 12px; padding: 1rem 1.15rem;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem 1.15rem;
     }
     .stat .val { font-size: 1.5rem; font-weight: 700; line-height: 1.2; }
     .stat .lbl { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
     .stat.danger .val { color: var(--err); }
     .stat.ok .val { color: var(--ok); }
     .stat.warn .val { color: var(--warn); }
+
+    /* FILES */
     .file-list { list-style: none; }
     .file-list li {
-      display: flex; align-items: center; justify-content: space-between; gap: 1rem;
-      padding: .55rem 0; border-bottom: 1px solid var(--border); font-size: .9rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: .55rem 0;
+      border-bottom: 1px solid var(--border);
+      font-size: .9rem;
     }
     .file-list a { color: var(--accent2); text-decoration: none; }
     .file-list a:hover { text-decoration: underline; }
     .empty { color: var(--muted); font-size: .9rem; padding: .5rem 0; }
+
+    /* DETAIL MODAL-ish panel */
     .detail-panel {
-      background: var(--card2); border: 1px solid var(--border);
-      border-radius: 12px; padding: 1.25rem; margin-top: 1rem;
+      background: var(--card2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      margin-top: 1rem;
     }
     .detail-panel h3 { margin-bottom: .75rem; font-size: 1rem; }
     .detail-grid {
-      display: grid; grid-template-columns: 140px 1fr; gap: .4rem .75rem; font-size: .9rem;
+      display: grid;
+      grid-template-columns: 140px 1fr;
+      gap: .4rem .75rem;
+      font-size: .9rem;
     }
     .detail-grid dt { color: var(--muted); }
     .detail-grid dd { word-break: break-word; }
+
     footer {
-      margin-top: 2.5rem; text-align: center; color: var(--muted); font-size: .78rem;
+      margin-top: 2.5rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: .78rem;
     }
-    .page-title { font-size: 1.35rem; font-weight: 700; margin-bottom: .35rem; }
+    .page-title {
+      font-size: 1.35rem;
+      font-weight: 700;
+      margin-bottom: .35rem;
+    }
     .page-sub { color: var(--muted); font-size: .9rem; margin-bottom: 1.25rem; }
+
+    /* SEARCH highlight */
     .search-box { position: relative; flex: 2; min-width: 200px; }
     .search-box input { padding-left: 2.2rem; }
     .search-box::before {
-      content: "Q"; position: absolute; left: .7rem; top: 50%;
-      transform: translateY(-50%); font-size: .85rem; opacity: .6; font-weight: 700;
+      content: "🔍";
+      position: absolute;
+      left: .7rem;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: .85rem;
+      opacity: .6;
     }
   </style>
 </head>
@@ -308,7 +458,7 @@ LAYOUT = r"""
   <div class="shell">
     <nav>
       <a class="brand" href="{{ url_for('index') }}">
-        <span class="logo">T</span>
+        <span class="logo">₸</span>
         SZPT Monitor
       </a>
       <div class="nav-links">
@@ -317,6 +467,7 @@ LAYOUT = r"""
         <a href="{{ url_for('files_page') }}" class="{{ 'active' if request.endpoint == 'files_page' else '' }}">Файлы</a>
       </div>
     </nav>
+
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
         {% for cat, m in messages %}
@@ -324,24 +475,41 @@ LAYOUT = r"""
         {% endfor %}
       {% endif %}
     {% endwith %}
+
     {% block content %}{% endblock %}
+
     <footer>
-      SZPT Monitor · Актобе 
+      SZPT Monitor · Актобе · API ows.goszakup.gov.kz · эталон Stat.gov.kz · письма не отправляются по сети
     </footer>
   </div>
 </body>
 </html>
 """
 
+# ---------------------------------------------------------------------------
+# Pages
+# ---------------------------------------------------------------------------
+
 INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
-
+<div class="pills">
+  <div class="pill {{ 'ok' if has_token else 'warn' }}">
+    Токен OWS: <strong>{{ 'подключён' if has_token else 'нет — укажите в .env' }}</strong>
+  </div>
+  <div class="pill {{ 'ok' if etalon_count else 'warn' }}">
+    Эталон: <strong>{{ etalon_count }} файл(ов)</strong>
+  </div>
+  <div class="pill {{ 'ok' if results_count else 'warn' }}">
+    В базе: <strong>{{ results_count }} объявлений</strong>
+    {% if updated_at %}· {{ updated_at }}{% endif %}
+  </div>
+</div>
 
 <div class="grid grid-2">
   <div class="card">
     <h2><span class="num">1</span> Сканирование завышений</h2>
     <p style="color:var(--muted);font-size:.85rem;margin-bottom:.5rem;">
-      Запрос лотов через API, сравнение с эталоном Актобе, сохранение в Excel и на сайт.
+      Запрос лотов через API, сравнение с эталоном Актобе, сохранение в Excel и в базу сайта.
     </p>
     <form method="post" action="{{ url_for('scan') }}">
       <div class="row">
@@ -354,16 +522,44 @@ INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
           <input type="number" name="days" value="365" min="1" max="730">
         </div>
       </div>
-      <label>Макс. страниц API</label>
-      <input type="number" name="max_pages" value="80" min="1" max="200">
-      <button type="submit">Запустить скан</button>
+      <p style="color:var(--muted);font-size:.8rem;margin:.5rem 0 0;">
+        Без лимита страниц API — все лоты за период + поиск по keywords СЗПТ.
+      </p>
+      <div id="progress-box" style="display:none;margin-top:.75rem;">
+        <div style="background:#0f172a;border-radius:8px;height:10px;overflow:hidden;border:1px solid var(--border);">
+          <div id="progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#10b981);transition:width .3s;"></div>
+        </div>
+        <p id="progress-text" style="color:var(--muted);font-size:.8rem;margin-top:.4rem;">Ожидание…</p>
+      </div>
+      <button type="submit" id="btn-scan">▶ Запустить скан</button>
+      <script>
+        (function(){
+          var form = document.querySelector('form[action*="scan"]');
+          if(!form) return;
+          form.addEventListener('submit', function(){
+            var box = document.getElementById('progress-box');
+            var btn = document.getElementById('btn-scan');
+            if(box) box.style.display = 'block';
+            if(btn){ btn.disabled = true; btn.textContent = 'Сканирование…'; }
+            setInterval(function(){
+              fetch('/api/progress').then(function(r){ return r.json(); }).then(function(d){
+                var bar = document.getElementById('progress-bar');
+                var txt = document.getElementById('progress-text');
+                var pct = d.total ? Math.min(100, Math.round(100*d.current/d.total)) : (d.current ? 40 : 8);
+                if(bar) bar.style.width = pct + '%';
+                if(txt) txt.textContent = (d.stage||'') + ' — ' + (d.current||0) + (d.total ? '/'+d.total : '');
+              }).catch(function(){});
+            }, 1500);
+          });
+        })();
+      </script>
     </form>
   </div>
 
   <div class="card">
     <h2><span class="num">2</span> Письма ДЭР</h2>
     <p style="color:var(--muted);font-size:.85rem;margin-bottom:.5rem;">
-      Официальные письма RU/KZ в УЗ и УО по завышениям, превышающим порог.
+      Официальные письма RU/KZ в УЗ и УО + таблица-приложение (≥15%).
     </p>
     <form method="post" action="{{ url_for('letters') }}">
       <div class="row">
@@ -382,7 +578,11 @@ INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
       </div>
       <label>Период, дней</label>
       <input type="number" name="days" value="365" min="1" max="730">
-      <button type="submit" class="btn-ok">Сформировать письма</button>
+      <label>Адресат УЗ (ФИО, можно пусто)</label>
+      <input type="text" name="addr_uz" value="" placeholder="например: Султангереев Е.Б.">
+      <label>Адресат УО (ФИО, можно пусто)</label>
+      <input type="text" name="addr_uo" value="" placeholder="например: Кузембаева Б.Б.">
+      <button type="submit" class="btn-ok">✉ Сформировать письма</button>
     </form>
   </div>
 </div>
@@ -404,7 +604,7 @@ INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
       <div class="lbl">товаров СЗПТ</div>
     </div>
   </div>
-  <a class="btn btn-sm" href="{{ url_for('lots') }}" style="width:auto;">Смотреть все объявления</a>
+  <a class="btn btn-sm" href="{{ url_for('lots') }}" style="width:auto;">Смотреть все объявления →</a>
 </div>
 {% endif %}
 {% endblock %}
@@ -415,6 +615,7 @@ LOTS_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
 <div class="page-title">Объявления с завышением</div>
 <div class="page-sub">
   Данные последнего скана{% if updated_at %}: {{ updated_at }}{% endif %}.
+  Клик по строке — подробности.
 </div>
 
 <div class="stat-grid">
@@ -471,8 +672,9 @@ LOTS_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
         <th>Товар</th>
         <th>Предмет лота</th>
         <th>Цена / эталон</th>
-        <th>Сумма</th>
+        <th>Сумма / разница</th>
         <th>Заказчик</th>
+        <th>Поставщик</th>
         <th>Лот</th>
         <th></th>
       </tr>
@@ -486,18 +688,28 @@ LOTS_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
             +{{ '%.1f'|format(pct) }}%
           </span>
         </td>
-        <td><strong>{{ r.product or '-' }}</strong></td>
-        <td class="lot-name">{{ (r.lot_name or '-')[:80] }}{% if (r.lot_name or '')|length > 80 %}...{% endif %}</td>
+        <td><strong>{{ r.product or '—' }}</strong></td>
+        <td class="lot-name">{{ (r.lot_name or '—')[:80] }}{% if (r.lot_name or '')|length > 80 %}…{% endif %}</td>
         <td>
-          <div>{{ r.unit_price }} T</div>
-          <div class="mono">et. {{ r.etalon }} T</div>
+          <div>{{ r.unit_price }} ₸</div>
+          <div class="mono">эт. {{ r.etalon }} ₸ {% if r.etalon_period %}({{ r.etalon_period }}){% endif %}</div>
         </td>
-        <td>{{ r.amount }}</td>
+        <td>
+          <div>{{ r.amount }}</div>
+          <div class="mono">разн. {{ r.difference if r.difference is not none else '—' }}</div>
+        </td>
         <td class="customer">
-          <div>{{ (r.customer or '-')[:50] }}</div>
+          <div>{{ (r.customer or '—')[:50] }}</div>
           <div class="mono">{{ r.customer_bin or '' }}</div>
         </td>
-        <td class="mono">{{ r.lot_number or r.number_anno or r.lot_id or '-' }}</td>
+        <td class="customer">
+          <div>{{ (r.supplier_name or '—')[:40] }}</div>
+          <div class="mono">{{ r.supplier_biin or '' }}</div>
+        </td>
+        <td class="mono">
+          {{ r.lot_number or r.number_anno or r.lot_id or '—' }}
+          {% if r.lot_url %}<div><a href="{{ r.lot_url }}" target="_blank" rel="noopener" style="color:var(--accent2);font-size:.75rem;">открыть</a></div>{% endif %}
+        </td>
         <td>
           <a class="btn btn-sm btn-ghost" href="{{ url_for('lot_detail', idx=r._idx) }}">Подробнее</a>
         </td>
@@ -520,18 +732,19 @@ LOTS_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
 {% endblock %}
 """)
 
+# Fix Chinese "详情" -> Russian
+LOTS_HTML = LOTS_HTML.replace(">详情<", ">Подробнее<")
+
 DETAIL_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
 <div class="page-title">Карточка объявления</div>
-<div class="page-sub">
-  <a href="{{ url_for('lots') }}" style="color:var(--accent2);text-decoration:none;">← Назад к списку</a>
-</div>
+<div class="page-sub"><a href="{{ url_for('lots') }}" style="color:var(--accent2);text-decoration:none;">← Назад к списку</a></div>
 
 <div class="card">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;">
     <div>
       <h2 style="margin-bottom:.35rem;">{{ row.product or 'Товар' }}</h2>
-      <p style="color:var(--muted);max-width:600px;">{{ row.lot_name or '-' }}</p>
+      <p style="color:var(--muted);max-width:600px;">{{ row.lot_name or '—' }}</p>
     </div>
     {% set pct = (row.percent or 0)|float %}
     <span class="pct {{ 'high' if pct >= 50 else ('mid' if pct >= 25 else 'low') }}" style="font-size:1.1rem;padding:.4rem .8rem;">
@@ -542,29 +755,43 @@ DETAIL_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
   <div class="detail-panel">
     <h3>Цены</h3>
     <dl class="detail-grid">
-      <dt>Цена за единицу</dt><dd><strong>{{ row.unit_price }} T</strong></dd>
-      <dt>Эталон Актобе</dt><dd>{{ row.etalon }} T</dd>
+      <dt>Цена за единицу</dt><dd><strong>{{ row.unit_price }} ₸</strong></dd>
+      <dt>Эталон Актобе</dt><dd>{{ row.etalon }} ₸</dd>
       <dt>Отклонение</dt><dd>+{{ row.percent }}%</dd>
-      <dt>Сумма лота</dt><dd>{{ row.amount }} T</dd>
+      <dt>Сумма по договору</dt><dd>{{ row.amount }} ₸</dd>
+      <dt>Сумма по цене СЗПТ</dt><dd>{{ row.amount_szpt or '—' }} ₸</dd>
+      <dt>Разница</dt><dd><strong>{{ row.difference if row.difference is not none else '—' }} ₸</strong></dd>
       <dt>Количество</dt><dd>{{ row.qty }}</dd>
+      <dt>Период эталона</dt><dd>{{ row.etalon_period or '—' }}</dd>
     </dl>
   </div>
 
   <div class="detail-panel">
-    <h3>Заказчик и реквизиты</h3>
+    <h3>Заказчик и поставщик</h3>
     <dl class="detail-grid">
-      <dt>Заказчик</dt><dd>{{ row.customer or '-' }}</dd>
-      <dt>БИН заказчика</dt><dd class="mono">{{ row.customer_bin or '-' }}</dd>
-      <dt>БИН поставщика</dt><dd class="mono">{{ row.supplier_biin or '-' }}</dd>
-      <dt>Номер лота</dt><dd class="mono">{{ row.lot_number or '-' }}</dd>
-      <dt>Номер объявления</dt><dd class="mono">{{ row.number_anno or '-' }}</dd>
-      <dt>Номер договора</dt><dd class="mono">{{ row.contract_number or '-' }}</dd>
-      <dt>ID лота</dt><dd class="mono">{{ row.lot_id or '-' }}</dd>
-      <dt>Статус</dt><dd>{{ row.status or '-' }}</dd>
-      <dt>Дата</dt><dd>{{ row.date or '-' }}</dd>
-      <dt>Год</dt><dd>{{ row.year or '-' }}</dd>
+      <dt>Заказчик</dt><dd>{{ row.customer or '—' }}</dd>
+      <dt>БИН заказчика</dt><dd class="mono">{{ row.customer_bin or '—' }}</dd>
+      <dt>Поставщик</dt><dd>{{ row.supplier_name or '—' }}</dd>
+      <dt>БИН поставщика</dt><dd class="mono">{{ row.supplier_biin or '—' }}</dd>
+      <dt>Номер лота</dt><dd class="mono">{{ row.lot_number or '—' }}</dd>
+      <dt>Номер объявления</dt><dd class="mono">{{ row.number_anno or '—' }}</dd>
+      <dt>Номер договора</dt><dd class="mono">{{ row.contract_number or '—' }}</dd>
+      <dt>ID лота</dt><dd class="mono">{{ row.lot_id or '—' }}</dd>
+      <dt>Статус</dt><dd>{{ row.status or '—' }}</dd>
+      <dt>Дата</dt><dd>{{ row.date or '—' }}</dd>
+      <dt>Год</dt><dd>{{ row.year or '—' }}</dd>
     </dl>
   </div>
+
+  {% if row.lot_url or row.number_anno %}
+  <div style="margin-top:1.25rem;">
+    <a class="btn btn-sm" style="width:auto;margin-right:.5rem;"
+       href="{{ row.lot_url or ('https://goszakup.gov.kz/ru/announce/index/' ~ row.number_anno) }}"
+       target="_blank" rel="noopener">
+      Открыть лот на goszakup.gov.kz
+    </a>
+  </div>
+  {% endif %}
 </div>
 {% endblock %}
 """)
@@ -573,14 +800,17 @@ FILES_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
 {% block content %}
 <div class="page-title">Файлы</div>
 <div class="page-sub">Отчёты Excel и сгенерированные письма</div>
+
 <div class="grid grid-2">
   <div class="card">
-    <h2>output/ — Excel</h2>
+    <h2>output/ — Excel отчёты</h2>
     {% if out_files %}
       <ul class="file-list">
         {% for f in out_files %}
-          <li><span>{{ f }}</span>
-            <a href="{{ url_for('download_output', filename=f) }}">Скачать</a></li>
+          <li>
+            <span>{{ f }}</span>
+            <a href="{{ url_for('download_output', filename=f) }}">Скачать</a>
+          </li>
         {% endfor %}
       </ul>
     {% else %}
@@ -592,8 +822,10 @@ FILES_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
     {% if letter_files %}
       <ul class="file-list">
         {% for f in letter_files %}
-          <li><span>{{ f }}</span>
-            <a href="{{ url_for('download_letters', filename=f) }}">Скачать</a></li>
+          <li>
+            <span>{{ f }}</span>
+            <a href="{{ url_for('download_letters', filename=f) }}">Скачать</a>
+          </li>
         {% endfor %}
       </ul>
     {% else %}
@@ -604,6 +836,10 @@ FILES_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
 {% endblock %}
 """)
 
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -618,6 +854,7 @@ def index():
             pass
         if r.get("product"):
             products.add(r["product"])
+
     return render_template_string(
         INDEX_HTML,
         has_token=bool(OWS_TOKEN),
@@ -635,13 +872,16 @@ def index():
 def lots():
     all_rows = _load_results()
     meta = _results_meta()
+
     q = (request.args.get("q") or "").strip().lower()
     product = (request.args.get("product") or "").strip()
     min_pct = request.args.get("min_pct", type=float)
     if min_pct is None:
         min_pct = 0.0
     sort = request.args.get("sort") or "percent"
+
     products = sorted({r.get("product") for r in all_rows if r.get("product")})
+
     filtered = []
     for i, r in enumerate(all_rows):
         r = dict(r)
@@ -662,16 +902,16 @@ def lots():
             if q not in blob:
                 continue
         filtered.append(r)
-    reverse = sort in ("percent", "amount")
 
+    reverse = sort in ("percent", "amount")
     def sort_key(x):
         v = x.get(sort)
         try:
             return float(v)
         except (TypeError, ValueError):
             return str(v or "")
-
     filtered.sort(key=sort_key, reverse=reverse)
+
     avg = 0.0
     if filtered:
         s = 0.0
@@ -683,6 +923,7 @@ def lots():
             except (TypeError, ValueError):
                 pass
         avg = round(s / n, 1) if n else 0.0
+
     return render_template_string(
         LOTS_HTML,
         rows=filtered,
@@ -720,18 +961,17 @@ def files_page():
 def scan():
     th = request.form.get("threshold", DEFAULT_THRESHOLD_MONITOR)
     days = request.form.get("days", 365)
-    max_pages = request.form.get("max_pages", 80)
     cmd = [
         sys.executable, str(BASE / "run_scan.py"),
         "--threshold", str(th),
         "--days", str(days),
-        "--max-pages", str(max_pages),
     ]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=900, cwd=str(BASE),
             encoding="utf-8", errors="replace",
         )
+        # После скана подтянуть Excel в JSON для сайта
         xlsx_files = sorted(OUTPUT_DIR.glob("zavysheniya_*.xlsx"), reverse=True)
         if not xlsx_files:
             xlsx_files = sorted(OUTPUT_DIR.glob("*.xlsx"), reverse=True)
@@ -739,20 +979,25 @@ def scan():
             try:
                 df = pd.read_excel(xlsx_files[0])
                 colmap = {
-                    "Год": "year", "Дата": "date", "Товар": "product",
+                    "Год": "year", "Дата": "date", "Период эталона": "etalon_period",
+                    "Товар": "product",
                     "Предмет лота": "lot_name", "Цена за ед.": "unit_price",
                     "Эталон Актобе": "etalon", "% отклонения": "percent",
-                    "Сумма": "amount", "Количество": "qty",
+                    "Сумма": "amount", "Сумма по договору": "amount",
+                    "Сумма по цене СЗПТ": "amount_szpt", "Разница": "difference",
+                    "Количество": "qty",
                     "Заказчик": "customer", "БИН заказчика": "customer_bin",
+                    "Поставщик": "supplier_name", "БИН поставщика": "supplier_biin",
                     "Номер лота": "lot_number", "Номер объявления": "number_anno",
                     "Номер договора": "contract_number", "Статус": "status",
-                    "БИН поставщика": "supplier_biin", "ID лота": "lot_id",
+                    "ID лота": "lot_id",
                 }
                 df = df.rename(columns={k: v for k, v in colmap.items() if k in df.columns})
                 rows = df.to_dict(orient="records")
                 _save_results(rows, meta={"threshold": th, "days": days, "file": xlsx_files[0].name})
             except Exception as e:
                 flash(f"Скан выполнен, но не удалось загрузить таблицу: {e}", "err")
+
         if result.returncode == 0:
             n = len(_load_results())
             flash(f"Скан завершён. Найдено записей: {n}. Смотрите раздел «Объявления».", "ok")
@@ -771,12 +1016,18 @@ def letters():
     th = request.form.get("threshold", DEFAULT_THRESHOLD_LETTER)
     to = request.form.get("to", "uz,uo")
     days = request.form.get("days", 365)
+    addr_uz = (request.form.get("addr_uz") or "").strip()
+    addr_uo = (request.form.get("addr_uo") or "").strip()
     cmd = [
         sys.executable, str(BASE / "generate_letters.py"),
         "--threshold", str(th),
         "--to", to,
         "--days", str(days),
     ]
+    if addr_uz:
+        cmd.extend(["--addr-uz-ru", addr_uz, "--addr-uz-kz", addr_uz])
+    if addr_uo:
+        cmd.extend(["--addr-uo-ru", addr_uo, "--addr-uo-kz", addr_uo])
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=900, cwd=str(BASE),
@@ -806,7 +1057,20 @@ def download_letters(filename):
 
 @app.route("/api/results")
 def api_results():
-    return jsonify({**_results_meta(), "rows": _load_results()})
+    """JSON API для всех результатов (для отладки / интеграций)."""
+    return jsonify(_results_meta() | {"rows": _load_results()})
+
+
+@app.route("/api/progress")
+def api_progress():
+    path = OUTPUT_DIR / "scan_progress.json"
+    if path.exists():
+        try:
+            with open(path, encoding="utf-8") as f:
+                return jsonify(json.load(f))
+        except Exception:
+            pass
+    return jsonify({"stage": "ожидание", "current": 0, "total": 0, "extra": ""})
 
 
 if __name__ == "__main__":
