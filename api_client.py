@@ -149,84 +149,123 @@ class GoszakupClient:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         progress: ProgressCb = None,
+        mode: str = "fast",
+        max_pages: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Полный сбор лотов:
-        1) общий список за период (все страницы);
-        2) доп. поиск по ключевым словам каждого товара СЗПТ.
+        mode:
+          fast — один проход API (рекомендуется, ~1–5 мин)
+          full — + короткий поиск по 1 keyword на товар (дольше)
+        max_pages — ограничение страниц на один запрос (None = все)
         """
         seen: Set[Any] = set()
         results: List[Dict[str, Any]] = []
         cb = progress or _default_progress
 
-        def add_items(items_iter, label: str):
-            for item in items_iter:
-                lid = item.get("id")
-                if lid is None or lid in seen:
-                    continue
-                seen.add(lid)
-                results.append(item)
-
-        params: Dict[str, Any] = {"limit": 50}
+        params: Dict[str, Any] = {"limit": 100}  # крупнее страница = меньше запросов
         if date_from:
             params["date_from"] = date_from
         if date_to:
             params["date_to"] = date_to
 
         paths = ["/v3/lots", "/v2/lots", "/lots"]
-        base_ok = False
+
+        # --- 1) Основная выгрузка ---
         for path in paths:
             try:
                 cb(f"Загрузка {path}…", 0, 0)
-                add_items(
-                    self._paginate(path, dict(params), progress=cb, progress_label=path),
-                    path,
-                )
+                page = 0
+                next_url = None
+                p = dict(params)
+                loaded_here = 0
+                while True:
+                    if max_pages is not None and page >= max_pages:
+                        break
+                    try:
+                        if next_url:
+                            if str(next_url).startswith("http"):
+                                resp = self.session.get(next_url, timeout=90)
+                                if resp.status_code >= 400:
+                                    break
+                                data = resp.json()
+                            else:
+                                data = self._get(
+                                    next_url if str(next_url).startswith("/") else f"/{next_url}"
+                                )
+                        else:
+                            data = self._get(path, p)
+                    except GoszakupAPIError:
+                        break
+
+                    items = data.get("items") or data.get("data") or []
+                    if not items:
+                        break
+                    total_hint = int(data.get("total") or 0)
+                    for item in items:
+                        lid = item.get("id")
+                        if lid is None or lid in seen:
+                            continue
+                        seen.add(lid)
+                        results.append(item)
+                        loaded_here += 1
+
+                    page += 1
+                    cb(path, len(results), total_hint or len(results))
+
+                    next_page = data.get("next_page") or data.get("next")
+                    if next_page:
+                        next_url = next_page
+                    else:
+                        if len(items) < p.get("limit", 100):
+                            break
+                        if total_hint and page * p.get("limit", 100) >= total_hint:
+                            break
+                        p["offset"] = page * p.get("limit", 100)
+                        next_url = None
+                    time.sleep(API_PAUSE_SEC)
+
                 if results:
-                    base_ok = True
                     break
             except GoszakupAPIError as e:
                 if e.status_code in (404, 405):
                     continue
                 raise
 
-        # Поиск по keywords — чтобы не пропустить лоты с товарами СЗПТ
-        search_terms: List[str] = []
-        for kws in SZPT_PRODUCTS.values():
-            # берём 1–2 самых характерных слова
-            for kw in kws[:3]:
-                kw = kw.strip()
-                if len(kw) >= 3 and kw not in search_terms:
-                    search_terms.append(kw)
+        # --- 2) full: доп. keywords (ограниченно) ---
+        if mode == "full":
+            # 1 слово на товар, макс 20 терминов, макс 3 страницы на термин
+            search_terms: List[str] = []
+            for kws in SZPT_PRODUCTS.values():
+                for kw in kws[:1]:
+                    kw = kw.strip()
+                    if len(kw) >= 3 and kw not in search_terms:
+                        search_terms.append(kw)
+            search_terms = search_terms[:20]
 
-        # уникальные короткие запросы
-        search_terms = search_terms[:40]
-
-        for i, term in enumerate(search_terms):
-            cb(f"Поиск «{term}» ({i + 1}/{len(search_terms)})", len(results), 0)
-            for path in paths:
-                for param_name in ("name_ru", "nameRu", "search", "q"):
+            for i, term in enumerate(search_terms):
+                cb(f"Keyword «{term}» ({i + 1}/{len(search_terms)})", len(results), 0)
+                for path in paths:
                     p = dict(params)
-                    p[param_name] = term
+                    p["name_ru"] = term
                     try:
-                        for item in self._paginate(
-                            path, p, progress=None, progress_label=term
-                        ):
+                        page = 0
+                        for item in self._paginate(path, p, progress=None, progress_label=term):
                             lid = item.get("id")
                             if lid is None or lid in seen:
                                 continue
                             seen.add(lid)
                             results.append(item)
+                            page += 1
+                            # ~3 страницы × 100 = 300 лотов на термин
+                            if page >= 300:
+                                break
                         break
                     except GoszakupAPIError:
                         continue
-                else:
-                    continue
-                break
-            time.sleep(API_PAUSE_SEC)
+                time.sleep(API_PAUSE_SEC)
 
-        cb(f"Итого уникальных лотов: {len(results)}", len(results), len(results))
-        print(f"\n[api] Всего уникальных лотов: {len(results)}")
+        cb(f"Итого: {len(results)} лотов", len(results), len(results))
+        print(f"\n[api] Режим={mode}. Уникальных лотов: {len(results)}")
         return results
 
     def get_lot(self, lot_id: int | str) -> Dict[str, Any]:

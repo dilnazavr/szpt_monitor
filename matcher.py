@@ -1,59 +1,101 @@
 """
-Сопоставление лотов с эталоном: гибкий поиск по keywords, % и разница.
+Сопоставление лотов с эталоном СЗПТ.
+Целые слова / основы; непищевые лоты отсекаются.
 """
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from config import BLACKLIST, FOOD_HINTS, SZPT_PRODUCTS
+from config import BLACKLIST, SZPT_PRODUCTS
 from etalon_loader import get_etalon_for_date
+
+NON_FOOD = [
+    "автомобил", "машина", "легков", "грузов", "автобус", "трактор",
+    "насос", "компрессор", "двигател", "генератор",
+    "шуруп", "болт", "гайк", "гвозд", "саморез", "метиз",
+    "выключател", "розетк", "кабель", "провод", "ламп", "светильн",
+    "приставк", "монитор", "компьютер", "принтер", "ноутбук", "сервер",
+    "анализатор", "микроскоп", "мебель", "стул", "стол ", "шкаф",
+    "услуг", "работ ", "строитель", "ремонт", "проектн",
+    "медикамент", "лекарств", "издел медицин", "шприц", "бинт",
+    "канцтовар", "бумаг", "картридж", "тонер",
+    "одежд", "обув", "спецодежд",
+    "бензин", "дизел", "топлив", "масло моторн",
+]
 
 
 def _normalize(text: str) -> str:
     if not isinstance(text, str):
         return ""
     text = text.lower().replace("ё", "е")
-    text = re.sub(r"[«»\"'()\[\]{},;:+]", " ", text)
+    text = re.sub(r"[«»\"'()\[\]{},;:+/\\|_.\-]", " ", text)
     text = re.sub(r"\s+", " ", text.strip())
     return text
 
 
+def _is_non_food(text: str) -> bool:
+    n = _normalize(text)
+    return any(x in n for x in NON_FOOD)
+
+
 def is_blacklisted(name: str) -> bool:
     n = _normalize(name)
-    return any(bl in n for bl in BLACKLIST)
+    if any(bl in n for bl in BLACKLIST):
+        return True
+    return _is_non_food(name)
+
+
+def _kw_in_text(text: str, kw: str) -> bool:
+    """
+    Keyword совпадает с целым словом или слово НАЧИНАЕТСЯ с keyword
+    (говядин → говядина), но НЕ ищет кусок в середине (лук ∉ полукруглой).
+    """
+    k = _normalize(kw).strip()
+    if len(k) < 3:
+        return False
+    words = _normalize(text).split()
+    for w in words:
+        if w == k:
+            return True
+        # основа: слово начинается с keyword, keyword достаточно длинный
+        if len(k) >= 4 and w.startswith(k):
+            return True
+        # keyword из 2+ слов: «масло подсолнеч»
+        if " " in k and k in text:
+            return True
+    return False
 
 
 def match_product(name: str, description: str = "") -> Optional[str]:
-    """Гибкое сопоставление: длинные keywords приоритетнее."""
-    if is_blacklisted(name):
+    if not name or not str(name).strip():
         return None
-    if description and is_blacklisted(description):
-        # описание с blacklist не всегда отбрасываем целиком
-        pass
-
-    combined = _normalize(name + " " + (description or ""))
-    if not combined:
+    if is_blacklisted(name) or _is_non_food(name):
         return None
 
-    candidates: List[Tuple[int, str]] = []
+    name_n = _normalize(name)
+    desc_n = _normalize(description or "")
+
+    scores: Dict[str, int] = {}
     for key, keywords in SZPT_PRODUCTS.items():
+        best = 0
         for kw in keywords:
-            k = _normalize(kw)
-            if len(k) < 2:
+            k = _normalize(kw).strip()
+            if len(k) < 3:
                 continue
-            # точное вхождение
-            if k in combined:
-                candidates.append((len(k) * 10, key))
-                continue
-            # слово целиком (границы)
-            if re.search(rf"(^|\s){re.escape(k)}(\s|$|[0-9%])", combined):
-                candidates.append((len(k) * 8, key))
+            if _kw_in_text(name_n, k):
+                best = max(best, len(k) * 10)
+            elif desc_n and len(k) >= 5 and _kw_in_text(desc_n, k):
+                best = max(best, len(k) * 2)
+        if best > 0:
+            scores[key] = best
 
-    if not candidates:
+    if not scores:
         return None
-    candidates.sort(reverse=True)
-    return candidates[0][1]
+    winner_key, winner_score = max(scores.items(), key=lambda x: x[1])
+    if winner_score < 30:
+        return None
+    return winner_key
 
 
 def calc_unit_price(amount: float, qty: float) -> Optional[float]:

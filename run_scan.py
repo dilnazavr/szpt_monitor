@@ -51,20 +51,24 @@ def write_progress(stage: str, current: int = 0, total: int = 0, extra: str = ""
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="SZPT Monitor — полный скан")
+    p = argparse.ArgumentParser(description="SZPT Monitor — скан")
     p.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD_MONITOR)
-    p.add_argument("--days", type=int, default=365)
+    p.add_argument("--days", type=int, default=90)
+    p.add_argument("--date-from", type=str, default=None, help="YYYY-MM-DD")
+    p.add_argument("--date-to", type=str, default=None, help="YYYY-MM-DD")
     p.add_argument("--output", type=str, default=None)
     p.add_argument("--etalon-dir", type=str, default=None)
-    # совместимость: игнорируем max-pages, грузим всё
-    p.add_argument("--max-pages", type=int, default=0, help="устарело, не используется")
+    p.add_argument("--mode", choices=("fast", "full"), default="full",
+                   help="full=нормальный полный поиск; fast=ускоренный")
+    p.add_argument("--max-pages", type=int, default=0,
+                   help="Лимит страниц (0=без лимита)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     print("=" * 60)
-    print("SZPT Monitor — Актобе (полный обход API)")
+    print("SZPT Monitor — Актобе")
     print("=" * 60)
 
     write_progress("Загрузка эталона", 0, 0)
@@ -82,10 +86,15 @@ def main():
         print(f"\nОШИБКА API: {e}")
         sys.exit(1)
 
-    date_to = datetime.now().strftime("%Y-%m-%d")
-    date_from = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    if args.date_from and args.date_to:
+        date_from = args.date_from.strip()[:10]
+        date_to = args.date_to.strip()[:10]
+    else:
+        date_to = datetime.now().strftime("%Y-%m-%d")
+        date_from = (datetime.now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
     print(f"Период: {date_from} … {date_to}")
-    print("Лимит страниц: НЕТ (загружаем все доступные данные)\n")
+    print(f"Режим: {args.mode}" + (f", max_pages={args.max_pages}" if args.max_pages else ""))
+    print()
 
     def progress_cb(msg: str, current: int = 0, total: int = 0):
         write_progress(msg, current, total)
@@ -96,6 +105,8 @@ def main():
             date_from=date_from,
             date_to=date_to,
             progress=progress_cb,
+            mode=args.mode,
+            max_pages=args.max_pages or None,
         )
     except GoszakupAPIError as e:
         print(f"\nОШИБКА при запросе лотов: {e}")
@@ -182,6 +193,12 @@ def main():
         }, f, ensure_ascii=False, indent=2)
 
     write_progress("Готово", len(results), len(results), f"найдено {len(results)}")
+    try:
+        lock = OUTPUT_DIR / "scan_running.lock"
+        if lock.exists():
+            lock.unlink()
+    except Exception:
+        pass
     print(f"JSON: {json_path}")
     print("Готово.")
 

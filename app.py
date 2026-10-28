@@ -7,6 +7,7 @@ SZPT Monitor — веб-интерфейс
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from datetime import datetime
@@ -38,6 +39,64 @@ app = Flask(__name__)
 app.secret_key = "szpt-monitor-aktobe-2026"
 
 RESULTS_JSON = OUTPUT_DIR / "last_results.json"
+
+# Текстовые поля — NaN из Excel нельзя резать срезом [:80]
+_TEXT_KEYS = (
+    "year", "date", "etalon_period", "product", "lot_name",
+    "customer", "customer_bin", "supplier_name", "supplier_biin",
+    "lot_number", "number_anno", "contract_number", "status",
+    "lot_url", "lot_id",
+)
+_NUM_KEYS = (
+    "unit_price", "etalon", "percent", "amount", "amount_szpt",
+    "difference", "qty",
+)
+
+
+def _is_nan(v: Any) -> bool:
+    if v is None:
+        return True
+    try:
+        if isinstance(v, float) and math.isnan(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        if pd.isna(v):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _clean_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    """NaN/None → '' для текста, None для чисел — чтобы Jinja не падала на [:N]."""
+    out = dict(r)
+    for k in _TEXT_KEYS:
+        if k not in out:
+            continue
+        v = out[k]
+        if _is_nan(v):
+            out[k] = ""
+        else:
+            out[k] = str(v)
+    for k in _NUM_KEYS:
+        if k not in out:
+            continue
+        v = out[k]
+        if _is_nan(v):
+            out[k] = None
+        else:
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                out[k] = None
+    return out
+
+
+def _clean_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [_clean_row(r) for r in rows if isinstance(r, dict)]
+
 BASE = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
@@ -55,7 +114,7 @@ def _load_results() -> List[Dict[str, Any]]:
         try:
             with open(RESULTS_JSON, encoding="utf-8") as f:
                 data = json.load(f)
-            return data.get("rows") or []
+            return _clean_rows(data.get("rows") or [])
         except Exception:
             pass
     # fallback: последний xlsx
@@ -81,7 +140,8 @@ def _load_results() -> List[Dict[str, Any]]:
             "ID лота": "lot_id", "Ссылка": "lot_url",
         }
         df = df.rename(columns={k: v for k, v in colmap.items() if k in df.columns})
-        return df.to_dict(orient="records")
+        df = df.where(pd.notnull(df), None)
+        return _clean_rows(df.to_dict(orient="records"))
     except Exception:
         return []
 
@@ -518,12 +578,31 @@ INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
           <input type="number" name="threshold" value="{{ th_mon }}" step="0.1" min="0">
         </div>
         <div>
-          <label>Период, дней</label>
-          <input type="number" name="days" value="365" min="1" max="730">
+          <label>Режим</label>
+          <select name="mode">
+            <option value="full" selected>Полный (нормальный, дольше)</option>
+            <option value="fast">Быстрый (может пропустить лоты)</option>
+          </select>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Дата с</label>
+          <input type="date" name="date_from" value="{{ date_from_default }}">
+        </div>
+        <div>
+          <label>Дата по</label>
+          <input type="date" name="date_to" value="{{ date_to_default }}">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Макс. страниц API (0 = все, без лимита)</label>
+          <input type="number" name="max_pages" value="0" min="0" max="5000">
         </div>
       </div>
       <p style="color:var(--muted);font-size:.8rem;margin:.5rem 0 0;">
-        Без лимита страниц API — все лоты за период + поиск по keywords СЗПТ.
+        Полный режим + 0 страниц = нормальная проверка (может занять 10–40 мин).
       </p>
       <div id="progress-box" style="display:none;margin-top:.75rem;">
         <div style="background:#0f172a;border-radius:8px;height:10px;overflow:hidden;border:1px solid var(--border);">
@@ -689,21 +768,21 @@ LOTS_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
           </span>
         </td>
         <td><strong>{{ r.product or '—' }}</strong></td>
-        <td class="lot-name">{{ (r.lot_name or '—')[:80] }}{% if (r.lot_name or '')|length > 80 %}…{% endif %}</td>
+        <td class="lot-name">{{ r.lot_name or '—' }}</td>
         <td>
-          <div>{{ r.unit_price }} ₸</div>
-          <div class="mono">эт. {{ r.etalon }} ₸ {% if r.etalon_period %}({{ r.etalon_period }}){% endif %}</div>
+          <div>{{ r.unit_price if r.unit_price is not none else '—' }} ₸</div>
+          <div class="mono">эт. {{ r.etalon if r.etalon is not none else '—' }} ₸ {% if r.etalon_period %}({{ r.etalon_period }}){% endif %}</div>
         </td>
         <td>
-          <div>{{ r.amount }}</div>
+          <div>{{ r.amount if r.amount is not none else '—' }}</div>
           <div class="mono">разн. {{ r.difference if r.difference is not none else '—' }}</div>
         </td>
         <td class="customer">
-          <div>{{ (r.customer or '—')[:50] }}</div>
+          <div>{{ r.customer or '—' }}</div>
           <div class="mono">{{ r.customer_bin or '' }}</div>
         </td>
         <td class="customer">
-          <div>{{ (r.supplier_name or '—')[:40] }}</div>
+          <div>{{ r.supplier_name or '—' }}</div>
           <div class="mono">{{ r.supplier_biin or '' }}</div>
         </td>
         <td class="mono">
@@ -855,6 +934,9 @@ def index():
         if r.get("product"):
             products.add(r["product"])
 
+    from datetime import timedelta as _td
+    _today = datetime.now().date()
+    _from = _today - _td(days=90)
     return render_template_string(
         INDEX_HTML,
         has_token=bool(OWS_TOKEN),
@@ -865,12 +947,14 @@ def index():
         th_let=DEFAULT_THRESHOLD_LETTER,
         max_pct=round(max_pct, 1),
         products_n=len(products),
+        date_from_default=_from.isoformat(),
+        date_to_default=_today.isoformat(),
     )
 
 
 @app.route("/lots")
 def lots():
-    all_rows = _load_results()
+    all_rows = _clean_rows(_load_results())
     meta = _results_meta()
 
     q = (request.args.get("q") or "").strip().lower()
@@ -880,11 +964,11 @@ def lots():
         min_pct = 0.0
     sort = request.args.get("sort") or "percent"
 
-    products = sorted({r.get("product") for r in all_rows if r.get("product")})
+    products = sorted({str(r.get("product")) for r in all_rows if r.get("product")})
 
     filtered = []
     for i, r in enumerate(all_rows):
-        r = dict(r)
+        r = _clean_row(dict(r))
         r["_idx"] = i
         try:
             pct = float(r.get("percent") or 0)
@@ -892,11 +976,12 @@ def lots():
             pct = 0.0
         if pct < min_pct:
             continue
-        if product and r.get("product") != product:
+        if product and str(r.get("product") or "") != product:
             continue
         if q:
             blob = " ".join(str(r.get(k) or "") for k in (
                 "product", "lot_name", "customer", "customer_bin",
+                "supplier_name", "supplier_biin",
                 "lot_number", "number_anno", "contract_number", "status",
             )).lower()
             if q not in blob:
@@ -941,11 +1026,11 @@ def lots():
 
 @app.route("/lots/<int:idx>")
 def lot_detail(idx: int):
-    rows = _load_results()
+    rows = _clean_rows(_load_results())
     if idx < 0 or idx >= len(rows):
         flash("Объявление не найдено", "err")
         return redirect(url_for("lots"))
-    return render_template_string(DETAIL_HTML, row=rows[idx])
+    return render_template_string(DETAIL_HTML, row=_clean_row(rows[idx]))
 
 
 @app.route("/files")
@@ -960,12 +1045,20 @@ def files_page():
 @app.route("/scan", methods=["POST"])
 def scan():
     th = request.form.get("threshold", DEFAULT_THRESHOLD_MONITOR)
-    days = request.form.get("days", 365)
+    date_from = (request.form.get("date_from") or "").strip()
+    date_to = (request.form.get("date_to") or "").strip()
+    mode = request.form.get("mode") or "full"
+    max_pages = request.form.get("max_pages") or "0"
     cmd = [
         sys.executable, str(BASE / "run_scan.py"),
         "--threshold", str(th),
-        "--days", str(days),
+        "--mode", str(mode),
+        "--max-pages", str(max_pages),
     ]
+    if date_from and date_to:
+        cmd.extend(["--date-from", date_from, "--date-to", date_to])
+    else:
+        cmd.extend(["--days", "90"])
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=900, cwd=str(BASE),
@@ -993,7 +1086,8 @@ def scan():
                     "ID лота": "lot_id",
                 }
                 df = df.rename(columns={k: v for k, v in colmap.items() if k in df.columns})
-                rows = df.to_dict(orient="records")
+                df = df.where(pd.notnull(df), None)
+                rows = _clean_rows(df.to_dict(orient="records"))
                 _save_results(rows, meta={"threshold": th, "days": days, "file": xlsx_files[0].name})
             except Exception as e:
                 flash(f"Скан выполнен, но не удалось загрузить таблицу: {e}", "err")
