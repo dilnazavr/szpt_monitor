@@ -10,6 +10,7 @@ import json
 import math
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -604,32 +605,56 @@ INDEX_HTML = LAYOUT.replace("{% block content %}{% endblock %}", r"""
       <p style="color:var(--muted);font-size:.8rem;margin:.5rem 0 0;">
         Полный режим + 0 страниц = нормальная проверка (может занять 10–40 мин).
       </p>
-      <div id="progress-box" style="display:none;margin-top:.75rem;">
-        <div style="background:#0f172a;border-radius:8px;height:10px;overflow:hidden;border:1px solid var(--border);">
+      <div id="progress-box" style="margin-top:.75rem;">
+        <div style="background:#0f172a;border-radius:8px;height:12px;overflow:hidden;border:1px solid var(--border);">
           <div id="progress-bar" style="height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#10b981);transition:width .3s;"></div>
         </div>
-        <p id="progress-text" style="color:var(--muted);font-size:.8rem;margin-top:.4rem;">Ожидание…</p>
+        <p id="progress-text" style="color:var(--muted);font-size:.85rem;margin-top:.45rem;">Прогресс: ожидание запуска…</p>
       </div>
       <button type="submit" id="btn-scan">▶ Запустить скан</button>
       <script>
         (function(){
+          var box = document.getElementById('progress-box');
+          var bar = document.getElementById('progress-bar');
+          var txt = document.getElementById('progress-text');
+          var btn = document.getElementById('btn-scan');
+          function tick(){
+            fetch('/api/progress').then(function(r){ return r.json(); }).then(function(d){
+              var stage = (d.stage || '').toString();
+              var cur = d.current || 0;
+              var tot = d.total || 0;
+              var extra = d.extra || '';
+              var running = d.running || (stage && stage !== 'ожидание' && stage !== 'Готово');
+              var pct = tot ? Math.min(100, Math.round(100 * cur / tot)) : (running ? Math.min(90, 10 + (cur % 80)) : 0);
+              if(stage === 'Готово') pct = 100;
+              if(bar) bar.style.width = pct + '%';
+              if(txt){
+                var line = stage ? stage : 'ожидание';
+                if(cur || tot) line += ' — ' + cur + (tot ? '/' + tot : '');
+                if(extra) line += ' · ' + extra;
+                if(pct) line += ' · ' + pct + '%';
+                txt.textContent = line;
+              }
+              if(btn && running && stage !== 'Готово'){
+                btn.disabled = true;
+                btn.textContent = 'Сканирование…';
+              }
+              if(btn && stage === 'Готово'){
+                btn.disabled = false;
+                btn.textContent = '▶ Запустить скан';
+              }
+            }).catch(function(){});
+          }
+          tick();
+          setInterval(tick, 1500);
           var form = document.querySelector('form[action*="scan"]');
-          if(!form) return;
-          form.addEventListener('submit', function(){
-            var box = document.getElementById('progress-box');
-            var btn = document.getElementById('btn-scan');
-            if(box) box.style.display = 'block';
-            if(btn){ btn.disabled = true; btn.textContent = 'Сканирование…'; }
-            setInterval(function(){
-              fetch('/api/progress').then(function(r){ return r.json(); }).then(function(d){
-                var bar = document.getElementById('progress-bar');
-                var txt = document.getElementById('progress-text');
-                var pct = d.total ? Math.min(100, Math.round(100*d.current/d.total)) : (d.current ? 40 : 8);
-                if(bar) bar.style.width = pct + '%';
-                if(txt) txt.textContent = (d.stage||'') + ' — ' + (d.current||0) + (d.total ? '/'+d.total : '');
-              }).catch(function(){});
-            }, 1500);
-          });
+          if(form){
+            form.addEventListener('submit', function(){
+              if(btn){ btn.disabled = true; btn.textContent = 'Сканирование…'; }
+              if(txt) txt.textContent = 'Запуск скана…';
+              if(bar) bar.style.width = '5%';
+            });
+          }
         })();
       </script>
     </form>
@@ -1044,6 +1069,7 @@ def files_page():
 
 @app.route("/scan", methods=["POST"])
 def scan():
+    """Полный скан в фоне — сайт не обрывает через 15 мин."""
     th = request.form.get("threshold", DEFAULT_THRESHOLD_MONITOR)
     date_from = (request.form.get("date_from") or "").strip()
     date_to = (request.form.get("date_to") or "").strip()
@@ -1059,49 +1085,52 @@ def scan():
         cmd.extend(["--date-from", date_from, "--date-to", date_to])
     else:
         cmd.extend(["--days", "90"])
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=900, cwd=str(BASE),
-            encoding="utf-8", errors="replace",
-        )
-        # После скана подтянуть Excel в JSON для сайта
-        xlsx_files = sorted(OUTPUT_DIR.glob("zavysheniya_*.xlsx"), reverse=True)
-        if not xlsx_files:
-            xlsx_files = sorted(OUTPUT_DIR.glob("*.xlsx"), reverse=True)
-        if xlsx_files:
-            try:
-                df = pd.read_excel(xlsx_files[0])
-                colmap = {
-                    "Год": "year", "Дата": "date", "Период эталона": "etalon_period",
-                    "Товар": "product",
-                    "Предмет лота": "lot_name", "Цена за ед.": "unit_price",
-                    "Эталон Актобе": "etalon", "% отклонения": "percent",
-                    "Сумма": "amount", "Сумма по договору": "amount",
-                    "Сумма по цене СЗПТ": "amount_szpt", "Разница": "difference",
-                    "Количество": "qty",
-                    "Заказчик": "customer", "БИН заказчика": "customer_bin",
-                    "Поставщик": "supplier_name", "БИН поставщика": "supplier_biin",
-                    "Номер лота": "lot_number", "Номер объявления": "number_anno",
-                    "Номер договора": "contract_number", "Статус": "status",
-                    "ID лота": "lot_id",
-                }
-                df = df.rename(columns={k: v for k, v in colmap.items() if k in df.columns})
-                df = df.where(pd.notnull(df), None)
-                rows = _clean_rows(df.to_dict(orient="records"))
-                _save_results(rows, meta={"threshold": th, "days": days, "file": xlsx_files[0].name})
-            except Exception as e:
-                flash(f"Скан выполнен, но не удалось загрузить таблицу: {e}", "err")
 
-        if result.returncode == 0:
-            n = len(_load_results())
-            flash(f"Скан завершён. Найдено записей: {n}. Смотрите раздел «Объявления».", "ok")
-        else:
-            msg = (result.stderr or result.stdout or "Неизвестная ошибка").strip()
-            flash(f"Ошибка скана:\n{msg[:1500]}", "err")
-    except subprocess.TimeoutExpired:
-        flash("Скан превысил время ожидания (15 мин).", "err")
+    # уже идёт скан? (замок; старше 20 мин — сбрасываем)
+    lock = OUTPUT_DIR / "scan_running.lock"
+    if lock.exists():
+        try:
+            age = time.time() - lock.stat().st_mtime
+            if age < 20 * 60:
+                flash(
+                    "Скан уже выполняется (или остался старый замок). "
+                    "Если скана нет — удалите output\\scan_running.lock и нажмите снова.",
+                    "ok",
+                )
+                return redirect(url_for("index"))
+            lock.unlink(missing_ok=True)
+        except Exception:
+            try:
+                lock.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = OUTPUT_DIR / "scan_last.log"
+        lock.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+        log_f = open(log_path, "w", encoding="utf-8")
+        # фон: не ждём окончания (полный скан может идти 30–90 мин)
+        subprocess.Popen(
+            cmd,
+            cwd=str(BASE),
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+        )
+        flash(
+            "Скан запущен в фоне (может занять 20–90 мин). "
+            "Не закрывайте окно сервера. Обновляйте страницу — прогресс и результаты появятся сами. "
+            "Готово, когда в «Объявлениях» обновятся данные.",
+            "ok",
+        )
     except Exception as e:
-        flash(f"Исключение: {e}", "err")
+        flash(f"Не удалось запустить скан: {e}", "err")
+        try:
+            lock.unlink(missing_ok=True)
+        except Exception:
+            pass
     return redirect(url_for("index"))
 
 
@@ -1158,13 +1187,18 @@ def api_results():
 @app.route("/api/progress")
 def api_progress():
     path = OUTPUT_DIR / "scan_progress.json"
+    lock = OUTPUT_DIR / "scan_running.lock"
+    data = {"stage": "ожидание", "current": 0, "total": 0, "extra": "", "running": False}
     if path.exists():
         try:
             with open(path, encoding="utf-8") as f:
-                return jsonify(json.load(f))
+                data.update(json.load(f))
         except Exception:
             pass
-    return jsonify({"stage": "ожидание", "current": 0, "total": 0, "extra": ""})
+    data["running"] = bool(lock.exists()) or (
+        str(data.get("stage") or "") not in ("", "ожидание", "Готово")
+    )
+    return jsonify(data)
 
 
 if __name__ == "__main__":

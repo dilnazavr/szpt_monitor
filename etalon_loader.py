@@ -1,16 +1,24 @@
 """
-Эталон СЗПТ по Актобе — цены СТРОГО по периоду (месяц/квартал).
-Лот за январь 2026 сравнивается с эталоном января 2026 (не с июнем!).
+Эталон СЗПТ по Актобе из файлов Т-15-05-Н (ДД.ММ.ГГГГ) рус.xls
+
+Нужный лист: «Средние цены на социально-значимые продовольственные товары»
+Колонка: Актобе
 """
 from __future__ import annotations
 
 import re
+from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from config import ETALON_DIR, ETALON_PERIOD_MODE, SZPT_PRODUCTS
+
+try:
+    from config import ETALON_MAX_DAY_GAP
+except ImportError:
+    ETALON_MAX_DAY_GAP = 10
 
 MONTHS_RU = {
     "январ": 1, "феврал": 2, "март": 3, "апрел": 4,
@@ -22,193 +30,248 @@ MONTHS_RU = {
 def _normalize(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    return re.sub(r"\s+", " ", text.lower().strip())
+    return re.sub(r"\s+", " ", text.lower().replace("ё", "е").strip())
 
 
 def _match_product(name: str) -> Optional[str]:
     n = _normalize(name)
+    if not n or n.startswith("социально") or "тенге" in n:
+        return None
+    # Явные приоритеты по корню названия (лист Stat.gov)
+    if "хлеб" in n:
+        return "хлеб"
+    if n.startswith("мука") or n.startswith("муки"):
+        return "мука"
+    if "говядина бескост" in n or "бескостная говяд" in n:
+        return "говядина_бескостная"
+    if "говядина" in n or "говядин" in n:
+        return "говядина"
+    if "мясо кур" in n or n.startswith("куры"):
+        return "мясо_кур"
     best, best_len = None, 0
     for key, keywords in SZPT_PRODUCTS.items():
         for kw in keywords:
             k = _normalize(kw)
-            if k and k in n and len(k) > best_len:
+            if len(k) < 3:
+                continue
+            if k in n and len(k) > best_len:
                 best, best_len = key, len(k)
     return best
 
 
-def _period_from_ym(year: int, month: int) -> str:
-    month = max(1, min(12, int(month)))
-    if ETALON_PERIOD_MODE == "quarter":
-        return f"{year}-Q{(month - 1) // 3 + 1}"
-    return f"{year}-{month:02d}"
+def _iso_week_key(d: date) -> str:
+    iso = d.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def _parse_period_from_text(text: str) -> Optional[str]:
-    """Вытащить период из имени файла или заголовка листа."""
+def _period_from_date(d: date) -> str:
+    mode = (ETALON_PERIOD_MODE or "month").lower()
+    if mode == "week":
+        return _iso_week_key(d)
+    if mode == "quarter":
+        return f"{d.year}-Q{(d.month - 1) // 3 + 1}"
+    return f"{d.year}-{d.month:02d}"
+
+
+def _parse_date_from_text(text: str) -> Optional[date]:
     n = _normalize(text)
     if not n:
         return None
-
-    # 2025-09-30, 2025_09_30, 2025.09.30
     m = re.search(r"(20\d{2})[-_./](\d{1,2})[-_./](\d{1,2})", n)
     if m:
-        return _period_from_ym(int(m.group(1)), int(m.group(2)))
-
-    # 30.09.2025
-    m = re.search(r"(\d{1,2})[.](\d{1,2})[.](20\d{2})", n)
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})", n)
     if m:
-        return _period_from_ym(int(m.group(3)), int(m.group(2)))
-
-    # на 30 сентября 2025 / сентябрь 2025
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
     year_m = re.search(r"(20\d{2})", n)
     if year_m:
         y = int(year_m.group(1))
+        day_m = re.search(
+            r"\b(\d{1,2})\s*(?:январ|феврал|март|апрел|ма[йяе]|июн|июл|август|сентябр|октябр|ноябр|декабр)",
+            n,
+        )
+        day = int(day_m.group(1)) if day_m else 15
         for key, mo in MONTHS_RU.items():
             if key in n:
-                return _period_from_ym(y, mo)
-
+                try:
+                    return date(y, mo, max(1, min(28, day)))
+                except ValueError:
+                    return date(y, mo, 15)
     return None
 
 
-def _period_to_sort_key(period: str) -> Tuple[int, int]:
-    """Для сравнения близости периодов: (year, month)."""
+def _parse_period_from_text(text: str) -> Optional[str]:
+    d = _parse_date_from_text(text)
+    return _period_from_date(d) if d else None
+
+
+def _period_to_date(period: str) -> Optional[date]:
+    m = re.match(r"(20\d{2})-W(\d{2})$", period)
+    if m:
+        try:
+            return date.fromisocalendar(int(m.group(1)), int(m.group(2)), 3)
+        except ValueError:
+            return None
     m = re.match(r"(20\d{2})-(\d{2})$", period)
     if m:
-        return int(m.group(1)), int(m.group(2))
-    m = re.match(r"(20\d{2})-Q(\d)", period)
-    if m:
-        return int(m.group(1)), int(m.group(2)) * 3
-    m = re.match(r"(20\d{2})$", period)
-    if m:
-        return int(m.group(1)), 6
-    return 0, 0
+        try:
+            return date(int(m.group(1)), int(m.group(2)), 15)
+        except ValueError:
+            return None
+    return None
 
 
-def _months_diff(p1: str, p2: str) -> int:
-    y1, m1 = _period_to_sort_key(p1)
-    y2, m2 = _period_to_sort_key(p2)
-    return abs((y1 * 12 + m1) - (y2 * 12 + m2))
+def _days_between_periods(p1: str, p2: str) -> int:
+    d1, d2 = _period_to_date(p1), _period_to_date(p2)
+    if not d1 or not d2:
+        return 9999
+    return abs((d1 - d2).days)
 
 
-def parse_lot_period(date_str: str) -> Optional[str]:
-    """Период лота из даты API (ISO, RU и т.п.)."""
+def parse_lot_date(date_str: str) -> Optional[date]:
     if not date_str:
         return None
     s = str(date_str).strip()
-    # 2025-12-15T10:00:00
     m = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", s)
     if m:
-        return _period_from_ym(int(m.group(1)), int(m.group(2)))
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
     m = re.search(r"(\d{1,2})[.](\d{1,2})[.](20\d{2})", s)
     if m:
-        return _period_from_ym(int(m.group(3)), int(m.group(2)))
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
     try:
         ts = pd.Timestamp(s)
         if not pd.isna(ts):
-            return _period_from_ym(int(ts.year), int(ts.month))
+            return ts.date()
     except Exception:
         pass
     return None
 
 
+def parse_lot_period(date_str: str) -> Optional[str]:
+    d = parse_lot_date(date_str)
+    return _period_from_date(d) if d else None
+
+
 def _find_aktobe_column(df: pd.DataFrame) -> Optional[int]:
-    for col_idx, col in enumerate(df.columns):
-        val = _normalize(str(col))
-        if "актобе" in val or "актөбе" in val or "ақтөбе" in val:
-            return col_idx
-    for col_idx in range(min(40, len(df.columns))):
-        for row_idx in range(min(20, len(df))):
+    for col_idx in range(min(40, df.shape[1])):
+        for row_idx in range(min(8, df.shape[0])):
             val = _normalize(str(df.iloc[row_idx, col_idx]))
-            if "актобе" in val or "актөбе" in val or "ақтөбе" in val:
+            if val in ("актобе", "актөбе", "ақтөбе") or val.startswith("актобе"):
                 return col_idx
     return None
 
 
 def _find_product_column(df: pd.DataFrame) -> int:
-    for col_idx in range(min(6, len(df.columns))):
-        sample = " ".join(str(df.iloc[i, col_idx]) for i in range(min(30, len(df))))
-        if any(kw in _normalize(sample) for prod in SZPT_PRODUCTS.values() for kw in prod):
+    for col_idx in range(min(3, df.shape[1])):
+        hits = sum(1 for i in range(min(40, df.shape[0])) if _match_product(str(df.iloc[i, col_idx])))
+        if hits >= 3:
             return col_idx
     return 0
 
 
-def _extract_period_from_sheet(df: pd.DataFrame, filename: str) -> Optional[str]:
-    """Период: сначала из имени файла, иначе из первых ячеек листа."""
-    p = _parse_period_from_text(filename)
-    if p:
-        return p
-    # первые 15x10 ячеек — часто «на 30 сентября 2025 г.»
-    chunks: List[str] = [filename]
-    for r in range(min(15, df.shape[0])):
+def _sheet_is_average_prices(df: pd.DataFrame, sheet_name: str) -> bool:
+    blob = _normalize(str(sheet_name))
+    for r in range(min(5, df.shape[0])):
         for c in range(min(10, df.shape[1])):
-            chunks.append(str(df.iloc[r, c]))
-    return _parse_period_from_text(" ".join(chunks))
+            blob += " " + _normalize(str(df.iloc[r, c]))
+    if "средн" in blob and "цен" in blob:
+        return True
+    if "тенге" in blob and _find_aktobe_column(df) is not None:
+        return True
+    if _find_aktobe_column(df) is not None:
+        prod_col = _find_product_column(df)
+        hits = sum(1 for i in range(min(40, df.shape[0])) if _match_product(str(df.iloc[i, prod_col])))
+        if hits >= 5:
+            return True
+    return False
 
 
 def load_single_file(path: Path) -> Tuple[Optional[str], Dict[str, float]]:
     prices: Dict[str, float] = {}
-    period: Optional[str] = None
+    period: Optional[str] = _parse_period_from_text(path.name)
     try:
         xl = pd.ExcelFile(path)
-        for sheet_name in xl.sheet_names:
-            df = pd.read_excel(path, sheet_name=sheet_name, header=None)
-            if df.empty or df.shape[1] < 2:
-                continue
-            if period is None:
-                period = _extract_period_from_sheet(df, path.name + " " + str(sheet_name))
-
-            aktobe_col = _find_aktobe_column(df)
-            if aktobe_col is None:
-                continue
-            prod_col = _find_product_column(df)
-            for r in range(df.shape[0]):
-                key = _match_product(str(df.iloc[r, prod_col]))
-                if not key:
-                    continue
-                try:
-                    val = df.iloc[r, aktobe_col]
-                    if pd.isna(val):
-                        continue
-                    price = float(str(val).replace(",", ".").replace(" ", "").replace("\xa0", ""))
-                    if price > 0:
-                        prices[key] = price
-                except (ValueError, TypeError):
-                    continue
-            if prices:
-                break
     except Exception as e:
-        print(f"[etalon] Ошибка чтения {path.name}: {e}")
+        print(f"[etalon] Не открыть {path.name}: {e} (для .xls: pip install xlrd)")
+        return period, prices
+
+    ordered: List[str] = []
+    for sn in xl.sheet_names:
+        try:
+            df0 = pd.read_excel(path, sheet_name=sn, header=None)
+        except Exception:
+            continue
+        if _sheet_is_average_prices(df0, sn):
+            ordered.insert(0, sn)
+        else:
+            ordered.append(sn)
+
+    for sheet_name in ordered:
+        try:
+            df = pd.read_excel(path, sheet_name=sheet_name, header=None)
+        except Exception:
+            continue
+        if df.empty or df.shape[1] < 3:
+            continue
+        if not _sheet_is_average_prices(df, sheet_name):
+            continue
+        aktobe_col = _find_aktobe_column(df)
+        if aktobe_col is None:
+            continue
+        prod_col = _find_product_column(df)
+        found: Dict[str, float] = {}
+        for r in range(df.shape[0]):
+            key = _match_product(str(df.iloc[r, prod_col]))
+            if not key:
+                continue
+            try:
+                val = df.iloc[r, aktobe_col]
+                if pd.isna(val):
+                    continue
+                raw = str(val).replace(",", ".").replace(" ", "").replace("\xa0", "")
+                raw = re.sub(r"[^\d.]", "", raw)
+                if not raw:
+                    continue
+                price = float(raw)
+                if price > 0:
+                    found[key] = price
+            except (ValueError, TypeError):
+                continue
+        if len(found) >= 3:
+            prices = found
+            print(f"[etalon] {path.name} лист «{sheet_name}» Актобе col={aktobe_col}: {len(found)} товаров")
+            break
     return period, prices
 
 
 def load_etalon_by_period(directory: Path | None = None) -> Dict[str, Dict[str, float]]:
-    """
-    { '2025-10': {'молоко': 362.0, 'помидоры': 890.0, ...}, '2026-01': {...} }
-
-    Важно: кладите несколько файлов за разные месяцы!
-    """
     directory = directory or ETALON_DIR
     files = sorted(directory.glob("*.xlsx")) + sorted(directory.glob("*.xls"))
     if not files:
         print(f"[etalon] Нет файлов в {directory}")
         return {}
-
     by_period: Dict[str, Dict[str, float]] = {}
     for f in files:
         period, part = load_single_file(f)
         if not part:
-            print(f"[etalon] {f.name}: товары не распознаны")
+            print(f"[etalon] {f.name}: средние цены / Актобе не найдены")
             continue
         key = period or "unknown"
         by_period.setdefault(key, {}).update(part)
-        print(f"[etalon] {f.name} -> период {key}: {len(part)} товаров — {list(part.keys())}")
-
-    print(f"[etalon] Всего периодов: {len(by_period)} → {sorted(by_period.keys())}")
-    if len(by_period) <= 1:
-        print(
-            "[etalon] ВНИМАНИЕ: только один период. "
-            "Для сезонности (помидоры зимой/летом) добавьте xlsx за разные месяцы."
-        )
+        print(f"[etalon] {f.name} -> {key}: {list(part.keys())}")
+    print(f"[etalon] Режим={ETALON_PERIOD_MODE}. Периодов: {len(by_period)} → {sorted(by_period.keys())}")
     return by_period
 
 
@@ -225,46 +288,33 @@ def get_etalon_for_date(
     date_str: str,
     product: str,
     max_month_gap: int = 2,
+    max_day_gap: Optional[int] = None,
 ) -> Tuple[Optional[float], str]:
-    """
-    Цена эталона для товара на дату лота.
-
-    Правила:
-    1) Точное совпадение месяца/квартала
-    2) Ближайший период в пределах max_month_gap месяцев (по умолчанию ±2)
-    3) Если ничего рядом нет — None (не берём летнюю цену для зимнего лота!)
-
-    Возвращает (price, period_key_used или пояснение).
-    """
     if not by_period or not product:
         return None, ""
-
     lot_period = parse_lot_period(date_str)
-
-    # 1. Точное совпадение
+    gap_days = max_day_gap if max_day_gap is not None else ETALON_MAX_DAY_GAP
+    mode = (ETALON_PERIOD_MODE or "month").lower()
     if lot_period and lot_period in by_period and product in by_period[lot_period]:
         return by_period[lot_period][product], lot_period
-
-    # 2. Ближайший период с этим товаром, но не дальше max_month_gap
     candidates: List[Tuple[int, str]] = []
     for k, prices in by_period.items():
         if product not in prices:
             continue
         if lot_period:
-            gap = _months_diff(lot_period, k)
-            if gap <= max_month_gap:
+            gap = _days_between_periods(lot_period, k)
+            limit = gap_days if mode == "week" else max_month_gap * 31
+            if gap <= limit:
                 candidates.append((gap, k))
         else:
-            # даты лота нет — берём самый свежий период
-            y, m = _period_to_sort_key(k)
-            candidates.append((-(y * 12 + m), k))
-
+            d = _period_to_date(k)
+            candidates.append((-(d.toordinal() if d else 0), k))
     if candidates:
         candidates.sort(key=lambda x: (x[0], x[1]))
         gap, k = candidates[0]
-        return by_period[k][product], k if gap == 0 else f"{k}(~{gap}мес)"
-
-    # 3. Не подставляем далёкий сезон
+        if gap == 0:
+            return by_period[k][product], k
+        return by_period[k][product], f"{k}(~{gap}дн)"
     return None, f"нет эталона рядом с {lot_period or date_str}"
 
 

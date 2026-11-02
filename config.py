@@ -29,7 +29,9 @@ REGION_KEYWORDS = [
 
 DEFAULT_THRESHOLD_MONITOR = 25.0
 DEFAULT_THRESHOLD_LETTER = 15.0
-ETALON_PERIOD_MODE = "month"
+# week | month | quarter — week для цен, которые меняются каждую неделю
+ETALON_PERIOD_MODE = "week"
+ETALON_MAX_DAY_GAP = 10
 
 # Расширенные keywords RU + KZ + варианты написания (как в лотах госзакупа)
 SZPT_PRODUCTS = {
