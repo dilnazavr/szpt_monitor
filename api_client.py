@@ -1,11 +1,14 @@
 """
-Клиент OWS API goszakup.gov.kz — без лимита страниц, с прогрессом и поиском по keywords.
+Клиент OWS API goszakup.gov.kz — поиск по Актобе / Актюбинской области.
+
+GraphQL: строки (не массивы) для nameDescriptionRu / customerNameRu — так требует живой API.
+REST: запасной путь + локальный фильтр региона.
 """
 from __future__ import annotations
 
 import sys
 import time
-from typing import Any, Callable, Dict, Generator, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
 
@@ -19,6 +22,27 @@ from config import (
     REGION_KEYWORDS,
     SZPT_PRODUCTS,
 )
+
+try:
+    from config import SZPT_SEARCH_TERMS
+except ImportError:
+    SZPT_SEARCH_TERMS = []
+
+
+try:
+    from config import LOT_STATUS_IDS
+except ImportError:
+    LOT_STATUS_IDS = [210, 220, 230, 240, 250, 260, 270, 280, 350, 360]
+
+try:
+    from config import AKTOBE_CUSTOMER_TERMS
+except ImportError:
+    AKTOBE_CUSTOMER_TERMS = ["*Актюбин", "*Актобе", "*Ақтөбе", "*Актөбе"]
+
+try:
+    from config import PAGES_PER_KEYWORD
+except ImportError:
+    PAGES_PER_KEYWORD = 6
 
 
 class GoszakupAPIError(Exception):
@@ -34,9 +58,9 @@ def _default_progress(msg: str, current: int = 0, total: int = 0) -> None:
     if total:
         pct = min(100, int(100 * current / max(total, 1)))
         bar = "#" * (pct // 5) + "-" * (20 - pct // 5)
-        line = f"\r[{bar}] {pct}% | {msg} | лотов: {current}"
+        line = f"\r[{bar}] {pct}% | {msg} | {current}/{total}"
     else:
-        line = f"\r>>> {msg} | загружено: {current}"
+        line = f"\r>>> {msg} | {current}"
     sys.stdout.write(line)
     sys.stdout.flush()
 
@@ -62,11 +86,8 @@ class GoszakupClient:
             resp = self.session.get(url, params=params or {}, timeout=90)
         except requests.RequestException as e:
             raise GoszakupAPIError(f"Сетевая ошибка: {e}") from e
-
         if resp.status_code == 401:
             raise GoszakupAPIError("401 Unauthorized — проверьте OWS_TOKEN", status_code=401)
-        if resp.status_code == 403:
-            raise GoszakupAPIError("403 Forbidden", status_code=403)
         if resp.status_code >= 400:
             raise GoszakupAPIError(
                 f"HTTP {resp.status_code}: {resp.text[:300]}",
@@ -77,196 +98,370 @@ class GoszakupClient:
         except ValueError:
             raise GoszakupAPIError("Ответ не является JSON")
 
-    def _paginate(
+    def _graphql(self, query: str, variables: Optional[Dict] = None) -> Dict[str, Any]:
+        url = f"{self.base_url}/v3/graphql"
+        payload = {"query": query, "variables": variables or {}}
+        try:
+            resp = self.session.post(url, json=payload, timeout=90)
+        except requests.RequestException as e:
+            raise GoszakupAPIError(f"GraphQL сеть: {e}") from e
+        if resp.status_code == 401:
+            raise GoszakupAPIError("401 Unauthorized — проверьте OWS_TOKEN", status_code=401)
+        if resp.status_code >= 400:
+            raise GoszakupAPIError(
+                f"GraphQL HTTP {resp.status_code}: {resp.text[:400]}",
+                status_code=resp.status_code,
+            )
+        try:
+            data = resp.json()
+        except ValueError:
+            raise GoszakupAPIError("GraphQL ответ не JSON")
+        if data.get("errors"):
+            msg = str(data["errors"])[:500]
+            raise GoszakupAPIError(f"GraphQL errors: {msg}")
+        return data.get("data") or {}
+
+    _LOTS_QUERY = """
+    query($limit: Int, $after: Int, $filter: LotsFiltersInput) {
+      Lots(limit: $limit, after: $after, filter: $filter) {
+        id
+        lotNumber
+        refLotStatusId
+        lastUpdateDate
+        count
+        amount
+        nameRu
+        nameKz
+        descriptionRu
+        descriptionKz
+        customerId
+        customerBin
+        customerNameRu
+        customerNameKz
+        trdBuyNumberAnno
+        trdBuyId
+        plnPointKatoList
+        indexDate
+      }
+    }
+    """
+
+    def _graphql_lots_page(
         self,
-        path: str,
-        params: Optional[Dict] = None,
-        progress: ProgressCb = None,
-        progress_label: str = "",
-    ) -> Generator[Dict[str, Any], None, None]:
-        """Пагинация БЕЗ лимита страниц — пока API отдаёт данные."""
-        params = dict(params or {})
-        params.setdefault("limit", 50)
-        page = 0
-        next_url: Optional[str] = None
-        loaded = 0
-        total_hint = 0
+        filt: Dict[str, Any],
+        limit: int = 200,
+        after: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        variables: Dict[str, Any] = {"limit": limit, "filter": filt}
+        if after is not None:
+            variables["after"] = after
+        data = self._graphql(self._LOTS_QUERY, variables)
+        items = data.get("Lots") or data.get("lots") or []
+        return items if isinstance(items, list) else []
+
+    def _graphql_collect(
+        self,
+        filt: Dict[str, Any],
+        max_pages: int,
+        progress: ProgressCb,
+        label: str,
+        seen: Set[Any],
+        results: List[Dict[str, Any]],
+        require_aktobe: bool = True,
+    ) -> int:
         cb = progress or _default_progress
-
-        while True:
+        added = 0
+        after: Optional[int] = None
+        for page in range(max_pages):
             try:
-                if next_url:
-                    if next_url.startswith("http"):
-                        resp = self.session.get(next_url, timeout=90)
-                        if resp.status_code >= 400:
-                            break
-                        data = resp.json()
+                items = self._graphql_lots_page(filt, limit=200, after=after)
+            except GoszakupAPIError as e:
+                if page == 0:
+                    # не роняем весь скан — пробуем другие фильтры
+                    err = str(e)
+                    if "invalid value" in err or "Expected type" in err:
+                        print(f"\n[api] фильтр отклонён ({label}): типы полей — пробуем другой вариант")
                     else:
-                        data = self._get(
-                            next_url if next_url.startswith("/") else f"/{next_url}"
-                        )
-                else:
-                    data = self._get(path, params)
-            except GoszakupAPIError:
+                        print(f"\n[api] GraphQL ({label}): {err[:200]}")
                 break
-
-            items = data.get("items") or data.get("data") or []
             if not items:
                 break
-
-            total_hint = int(data.get("total") or total_hint or 0)
-            for item in items:
-                loaded += 1
-                yield item
-
-            if page % 2 == 0 or not data.get("next_page"):
-                cb(
-                    progress_label or path,
-                    loaded,
-                    total_hint or loaded,
-                )
-
-            next_page = data.get("next_page") or data.get("next")
-            if next_page:
-                next_url = next_page
-            else:
-                total = data.get("total")
-                if total is not None and (page + 1) * params["limit"] >= int(total):
-                    break
-                if len(items) < params["limit"]:
-                    break
-                params["offset"] = (page + 1) * params["limit"]
-                next_url = None
-
-            page += 1
+            for raw in items:
+                lid = raw.get("id")
+                if lid is None or lid in seen:
+                    continue
+                item = _gql_to_rest_shape(raw)
+                if require_aktobe and not is_aktobe_region(item):
+                    continue
+                seen.add(lid)
+                results.append(item)
+                added += 1
+            cb(label, len(results), max_pages * 200)
+            last_id = items[-1].get("id")
+            if last_id is None:
+                break
+            after = int(last_id)
+            if len(items) < 200:
+                break
             time.sleep(API_PAUSE_SEC)
+        return added
 
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    def _build_filters(
+        self,
+        term: str,
+        customer: Optional[str] = None,
+        kato: Optional[str] = None,
+        date_filter: Optional[List[str]] = None,
+        with_status: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Несколько вариантов фильтра: живой API ждёт String, не [String],
+        для части полей. Пробуем по очереди.
+        """
+        variants: List[Dict[str, Any]] = []
+
+        def base() -> Dict[str, Any]:
+            f: Dict[str, Any] = {}
+            if with_status and LOT_STATUS_IDS:
+                # массив Int для статусов обычно ок
+                f["refLotStatusId"] = list(LOT_STATUS_IDS)
+            if date_filter:
+                f["lastUpdateDate"] = date_filter
+            return f
+
+        # 1) nameDescriptionRu + customer (строки)
+        if customer:
+            f = base()
+            f["nameDescriptionRu"] = term
+            f["customerNameRu"] = customer
+            variants.append(f)
+            f2 = base()
+            f2["nameRu"] = f"?{term}"  # частичное совпадение по доке
+            f2["customerNameRu"] = customer
+            variants.append(f2)
+
+        # 2) только товар + КАТО
+        if kato:
+            f = base()
+            f["nameDescriptionRu"] = term
+            f["plnPointKatoList"] = kato
+            variants.append(f)
+            f2 = base()
+            f2["nameRu"] = f"?{term}"
+            f2["plnPointKatoList"] = kato
+            variants.append(f2)
+
+        # 3) только заказчик Актобе (без товара) — один раз снаружи лучше
+        return variants
 
     def search_lots(
         self,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         progress: ProgressCb = None,
-        mode: str = "fast",
+        mode: str = "full",
         max_pages: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        mode:
-          fast — один проход API (рекомендуется, ~1–5 мин)
-          full — + короткий поиск по 1 keyword на товар (дольше)
-        max_pages — ограничение страниц на один запрос (None = все)
-        """
         seen: Set[Any] = set()
         results: List[Dict[str, Any]] = []
         cb = progress or _default_progress
 
-        params: Dict[str, Any] = {"limit": 100}  # крупнее страница = меньше запросов
-        if date_from:
-            params["date_from"] = date_from
-        if date_to:
-            params["date_to"] = date_to
+        if max_pages is None or max_pages == 0:
+            pages = PAGES_PER_KEYWORD if mode == "full" else max(3, PAGES_PER_KEYWORD // 2)
+        else:
+            pages = max(1, min(int(max_pages), 30))
 
-        paths = ["/v3/lots", "/v2/lots", "/lots"]
+        date_filter: Optional[List[str]] = None
+        if date_from and date_to:
+            date_filter = [date_from[:10], date_to[:10]]
+        elif date_from:
+            date_filter = [date_from[:10]]
 
-        # --- 1) Основная выгрузка ---
-        for path in paths:
-            try:
-                cb(f"Загрузка {path}…", 0, 0)
-                page = 0
-                next_url = None
-                p = dict(params)
-                loaded_here = 0
-                while True:
-                    if max_pages is not None and page >= max_pages:
+        # Сильные поисковые слова СЗПТ
+        terms: List[str] = []
+        for kw in (SZPT_SEARCH_TERMS or []):
+            kw = kw.strip()
+            if len(kw) >= 3 and kw not in terms:
+                terms.append(kw)
+        if not terms:
+            for kws in SZPT_PRODUCTS.values():
+                for kw in kws[:2]:
+                    kw = kw.strip()
+                    if len(kw) >= 4 and kw not in terms:
+                        terms.append(kw)
+        terms = terms[:16] if mode == "fast" else terms[:28]
+
+        print(
+            f"\n[api] Режим={mode}. Актобе/область. "
+            f"Слов СЗПТ: {len(terms)}, до {pages} стр./запрос"
+        )
+
+        # ---- A) каждое слово СЗПТ + заказчик Актобе ----
+        for i, term in enumerate(terms):
+            label = f"СЗПТ «{term}» + Актобе ({i + 1}/{len(terms)})"
+            cb(label, i, len(terms))
+            got = 0
+            for cust in AKTOBE_CUSTOMER_TERMS[:2]:
+                for filt in self._build_filters(term, customer=cust, date_filter=date_filter):
+                    n = self._graphql_collect(filt, pages, cb, label, seen, results)
+                    got += n
+                    if n:
+                        print(f"\n[api] {label}: +{n} (всего {len(results)})")
                         break
+                if got:
+                    break
+                time.sleep(API_PAUSE_SEC)
+            time.sleep(API_PAUSE_SEC)
+
+        # ---- B) КАТО 15 + каждое слово СЗПТ ----
+        for i, term in enumerate(terms):
+            label = f"КАТО15 «{term}» ({i + 1}/{len(terms)})"
+            cb(label, len(results), 0)
+            for filt in self._build_filters(
+                term, kato=KATO_PREFIX, date_filter=date_filter
+            ):
+                n = self._graphql_collect(
+                    filt, max(3, pages // 2), cb, label, seen, results
+                )
+                if n:
+                    print(f"\n[api] {label}: +{n} (всего {len(results)})")
+                    break
+            time.sleep(API_PAUSE_SEC)
+
+        # ---- C) товар по названию + локальный фильтр Актобе ----
+        print("\n[api] СЗПТ по названию + локальный фильтр Актобе…")
+        for i, term in enumerate(terms[:20]):
+            label = f"Товар «{term}» ({i + 1})"
+            cb(label, len(results), 0)
+            for name_field, name_val in (
+                ("nameDescriptionRu", term),
+                ("nameRu", f"?{term}"),
+            ):
+                filt = {name_field: name_val}
+                if date_filter:
+                    filt["lastUpdateDate"] = date_filter
+                n = self._graphql_collect(
+                    filt, max(2, pages // 2), cb, label, seen, results, require_aktobe=True
+                )
+                if n:
+                    print(f"\n[api] {label}: +{n} Актобе (всего {len(results)})")
+                    break
+            time.sleep(API_PAUSE_SEC)
+
+        # ---- D) широкий заказчик — только если мало ----
+        if len(results) < 30:
+            print("\n[api] Добор: все лоты заказчиков Актобе…")
+            for cust in AKTOBE_CUSTOMER_TERMS[:2]:
+                label = f"Заказчик {cust}"
+                filt = {"customerNameRu": cust}
+                if date_filter:
+                    filt["lastUpdateDate"] = date_filter
+                n = self._graphql_collect(filt, pages, cb, label, seen, results)
+                if n:
+                    print(f"\n[api] {label}: +{n} (всего {len(results)})")
+
+        # ---- D) REST fallback ----
+        if len(results) < 5:
+            print("\n[api] REST fallback…")
+            results.extend(
+                self._rest_search_aktobe(
+                    terms, date_from, date_to, pages, seen, cb
+                )
+            )
+
+        cb(f"Итого Актобе: {len(results)}", len(results), len(results))
+        print(f"\n[api] Готово. Уникальных лотов Актобе/области: {len(results)}")
+        return results
+
+    def _rest_search_aktobe(
+        self,
+        terms: List[str],
+        date_from: Optional[str],
+        date_to: Optional[str],
+        pages: int,
+        seen: Set[Any],
+        cb: ProgressCb,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        paths = ["/v3/lots", "/v2/lots"]
+
+        # 1) по словам СЗПТ
+        for i, term in enumerate(terms[:15]):
+            label = f"REST «{term}» ({i + 1})"
+            cb(label if cb else label, len(out) + len(seen), 0)
+            for path in paths:
+                offset = 0
+                for page in range(pages):
+                    params: Dict[str, Any] = {"limit": 100, "offset": offset}
+                    # разные имена параметров REST
+                    for key in ("name_ru", "nameRu", "search"):
+                        params[key] = term
+                    if date_from:
+                        params["date_from"] = date_from[:10]
+                        params["last_update_date_from"] = date_from[:10]
+                    if date_to:
+                        params["date_to"] = date_to[:10]
+                        params["last_update_date_to"] = date_to[:10]
                     try:
-                        if next_url:
-                            if str(next_url).startswith("http"):
-                                resp = self.session.get(next_url, timeout=90)
-                                if resp.status_code >= 400:
-                                    break
-                                data = resp.json()
-                            else:
-                                data = self._get(
-                                    next_url if str(next_url).startswith("/") else f"/{next_url}"
-                                )
-                        else:
-                            data = self._get(path, p)
+                        data = self._get(path, params)
                     except GoszakupAPIError:
                         break
-
                     items = data.get("items") or data.get("data") or []
                     if not items:
                         break
-                    total_hint = int(data.get("total") or 0)
-                    for item in items:
-                        lid = item.get("id")
+                    for raw in items:
+                        lid = raw.get("id")
                         if lid is None or lid in seen:
                             continue
+                        if not is_aktobe_region(raw):
+                            continue
                         seen.add(lid)
-                        results.append(item)
-                        loaded_here += 1
-
-                    page += 1
-                    cb(path, len(results), total_hint or len(results))
-
-                    next_page = data.get("next_page") or data.get("next")
-                    if next_page:
-                        next_url = next_page
-                    else:
-                        if len(items) < p.get("limit", 100):
-                            break
-                        if total_hint and page * p.get("limit", 100) >= total_hint:
-                            break
-                        p["offset"] = page * p.get("limit", 100)
-                        next_url = None
-                    time.sleep(API_PAUSE_SEC)
-
-                if results:
-                    break
-            except GoszakupAPIError as e:
-                if e.status_code in (404, 405):
-                    continue
-                raise
-
-        # --- 2) full: доп. keywords (ограниченно) ---
-        if mode == "full":
-            # 1 слово на товар, макс 20 терминов, макс 3 страницы на термин
-            search_terms: List[str] = []
-            for kws in SZPT_PRODUCTS.values():
-                for kw in kws[:1]:
-                    kw = kw.strip()
-                    if len(kw) >= 3 and kw not in search_terms:
-                        search_terms.append(kw)
-            search_terms = search_terms[:20]
-
-            for i, term in enumerate(search_terms):
-                cb(f"Keyword «{term}» ({i + 1}/{len(search_terms)})", len(results), 0)
-                for path in paths:
-                    p = dict(params)
-                    p["name_ru"] = term
-                    try:
-                        page = 0
-                        for item in self._paginate(path, p, progress=None, progress_label=term):
-                            lid = item.get("id")
-                            if lid is None or lid in seen:
-                                continue
-                            seen.add(lid)
-                            results.append(item)
-                            page += 1
-                            # ~3 страницы × 100 = 300 лотов на термин
-                            if page >= 300:
-                                break
+                        out.append(raw)
+                    offset += 100
+                    if len(items) < 100:
                         break
-                    except GoszakupAPIError:
-                        continue
-                time.sleep(API_PAUSE_SEC)
+                    time.sleep(API_PAUSE_SEC)
+                if out:
+                    break
+            print(f"\n[api] {label}: Актобе в выборке, всего найдено {len(seen)}")
 
-        cb(f"Итого: {len(results)} лотов", len(results), len(results))
-        print(f"\n[api] Режим={mode}. Уникальных лотов: {len(results)}")
-        return results
+        # 2) без name — только даты, фильтр Актобе (если API отдаёт customer_name)
+        if len(out) < 3 and date_from:
+            print("\n[api] REST: период без name, фильтр Актобе…")
+            for path in paths:
+                offset = 0
+                for page in range(min(pages * 2, 20)):
+                    params = {
+                        "limit": 100,
+                        "offset": offset,
+                        "date_from": date_from[:10],
+                    }
+                    if date_to:
+                        params["date_to"] = date_to[:10]
+                    try:
+                        data = self._get(path, params)
+                    except GoszakupAPIError:
+                        break
+                    items = data.get("items") or data.get("data") or []
+                    if not items:
+                        break
+                    for raw in items:
+                        lid = raw.get("id")
+                        if lid is None or lid in seen:
+                            continue
+                        if not is_aktobe_region(raw):
+                            continue
+                        seen.add(lid)
+                        out.append(raw)
+                    offset += 100
+                    if cb:
+                        cb("REST период+Актобе", len(seen), 0)
+                    if len(items) < 100:
+                        break
+                    time.sleep(API_PAUSE_SEC)
+                if out:
+                    break
+        return out
 
     def get_lot(self, lot_id: int | str) -> Dict[str, Any]:
         for path in (f"/v3/lots/{lot_id}", f"/v2/lots/{lot_id}", f"/lots/{lot_id}"):
@@ -279,61 +474,80 @@ class GoszakupClient:
         raise GoszakupAPIError(f"Лот {lot_id} не найден")
 
 
+def _gql_to_rest_shape(raw: Dict[str, Any]) -> Dict[str, Any]:
+    mapping = {
+        "id": "id",
+        "lotNumber": "lot_number",
+        "refLotStatusId": "ref_lot_status_id",
+        "lastUpdateDate": "last_update_date",
+        "count": "count",
+        "amount": "amount",
+        "nameRu": "name_ru",
+        "nameKz": "name_kz",
+        "descriptionRu": "description_ru",
+        "descriptionKz": "description_kz",
+        "customerId": "customer_id",
+        "customerBin": "customer_bin",
+        "customerNameRu": "customer_name_ru",
+        "customerNameKz": "customer_name_kz",
+        "trdBuyNumberAnno": "trd_buy_number_anno",
+        "trdBuyId": "trd_buy_id",
+        "plnPointKatoList": "pln_point_kato_list",
+        "indexDate": "index_date",
+    }
+    out: Dict[str, Any] = dict(raw)
+    for camel, snake in mapping.items():
+        if camel in raw and snake not in out:
+            out[snake] = raw[camel]
+    return out
+
+
 def is_aktobe_region(item: Dict[str, Any]) -> bool:
     kato_fields = [
-        item.get("kato"), item.get("kato_code"), item.get("ref_kato_code"),
-        item.get("customer_kato"), item.get("refKatoCode"),
+        item.get("kato"),
+        item.get("kato_code"),
+        item.get("ref_kato_code"),
+        item.get("customer_kato"),
+        item.get("refKatoCode"),
+        item.get("pln_point_kato_list"),
+        item.get("plnPointKatoList"),
     ]
     for k in kato_fields:
-        if k and str(k).startswith(KATO_PREFIX):
-            return True
-    if isinstance(item.get("kato_list"), list):
-        for k in item["kato_list"]:
-            if str(k).startswith(KATO_PREFIX):
+        if k is None:
+            continue
+        if isinstance(k, (list, tuple)):
+            for x in k:
+                if str(x).startswith(KATO_PREFIX):
+                    return True
+        else:
+            s = str(k).replace(" ", "")
+            if s.startswith(KATO_PREFIX) or f",{KATO_PREFIX}" in s:
                 return True
 
-    text_fields = [
-        item.get("name_ru") or "",
-        item.get("name_kz") or "",
+    text_parts = [
         item.get("customer_name_ru") or "",
         item.get("customer_name_kz") or "",
+        item.get("customerNameRu") or "",
+        item.get("customerNameKz") or "",
+        item.get("name_ru") or "",
         item.get("description_ru") or "",
-        item.get("description_kz") or "",
-        item.get("supplier_name_ru") or "",
+        item.get("nameRu") or "",
+        item.get("descriptionRu") or "",
     ]
-    for key in ("delivery_place", "address", "place", "point_list"):
-        val = item.get(key)
-        if isinstance(val, list):
-            text_fields.extend(str(x) for x in val)
-        elif val:
-            text_fields.append(str(val))
-
-    combined = " ".join(text_fields).lower()
-    return any(kw in combined for kw in REGION_KEYWORDS)
+    blob = " ".join(str(x) for x in text_parts).lower()
+    return any(kw in blob for kw in REGION_KEYWORDS)
 
 
-def build_lot_url(number_anno: str = "", trd_buy_id: Any = None, lot_id: Any = None) -> str:
+def build_lot_url(number_anno: str, trd_buy_id: Any, lot_id: Any) -> str:
     if number_anno:
         return LOT_URL_TEMPLATE.format(number_anno=number_anno)
-    if trd_buy_id:
-        return LOT_URL_BY_ID.format(trd_buy_id=trd_buy_id)
     if lot_id:
-        return f"https://goszakup.gov.kz/ru/search/lots?filter%5Blot_number%5D={lot_id}"
+        return LOT_URL_BY_ID.format(lot_id=lot_id)
     return ""
 
 
 def normalize_lot(raw: Dict[str, Any]) -> Dict[str, Any]:
-    amount = raw.get("amount") or raw.get("total_sum") or raw.get("price") or 0
-    qty = raw.get("count") or raw.get("quantity") or raw.get("qty") or 0
-    try:
-        amount = float(amount)
-    except (TypeError, ValueError):
-        amount = 0.0
-    try:
-        qty = float(qty)
-    except (TypeError, ValueError):
-        qty = 0.0
-
+    lot_id = raw.get("id")
     number_anno = (
         raw.get("trd_buy_number_anno")
         or raw.get("number_anno")
@@ -341,58 +555,34 @@ def normalize_lot(raw: Dict[str, Any]) -> Dict[str, Any]:
         or ""
     )
     trd_buy_id = raw.get("trd_buy_id") or raw.get("trdBuyId")
-    lot_id = raw.get("id")
-
+    status = raw.get("ref_lot_status_id") or raw.get("refLotStatusId") or ""
     return {
         "id": lot_id,
-        "lot_number": raw.get("lot_number") or raw.get("number") or str(lot_id or ""),
-        "name_ru": raw.get("name_ru") or raw.get("name") or raw.get("nameRu") or "",
+        "name_ru": raw.get("name_ru") or raw.get("nameRu") or "",
         "name_kz": raw.get("name_kz") or raw.get("nameKz") or "",
-        "description_ru": (
-            raw.get("description_ru") or raw.get("descriptionRu") or raw.get("description") or ""
-        ),
-        "amount": amount,
-        "qty": qty,
-        "customer_name": (
-            raw.get("customer_name_ru")
-            or raw.get("customer_name")
-            or raw.get("customerNameRu")
-            or raw.get("subject_name_ru")
-            or ""
-        ),
-        "customer_bin": (
-            raw.get("customer_bin")
-            or raw.get("customerBin")
-            or raw.get("subject_biin")
-            or ""
-        ),
-        "status_id": raw.get("ref_lot_status_id") or raw.get("ref_buy_status_id"),
-        "status": str(raw.get("ref_lot_status_id") or raw.get("status") or ""),
-        "trd_buy_id": trd_buy_id,
-        "number_anno": number_anno,
+        "description_ru": raw.get("description_ru") or raw.get("descriptionRu") or "",
+        "amount": raw.get("amount") or 0,
+        "qty": raw.get("count") or raw.get("qty") or 0,
         "date": (
             raw.get("last_update_date")
-            or raw.get("crdate")
-            or raw.get("publish_date")
+            or raw.get("lastUpdateDate")
             or raw.get("index_date")
+            or raw.get("indexDate")
             or ""
         ),
-        "contract_number": raw.get("contract_number") or raw.get("contractNumber") or "",
-        "supplier_biin": (
-            raw.get("supplier_biin")
-            or raw.get("supplier_bin")
-            or raw.get("supplierBiin")
-            or raw.get("supplier_iin")
+        "customer_name": (
+            raw.get("customer_name_ru")
+            or raw.get("customerNameRu")
+            or raw.get("customer_name")
             or ""
         ),
-        "supplier_name": (
-            raw.get("supplier_name_ru")
-            or raw.get("supplier_name")
-            or raw.get("supplierNameRu")
-            or raw.get("supplier_name_kz")
-            or raw.get("supplierNameKz")
-            or ""
-        ),
+        "customer_bin": raw.get("customer_bin") or raw.get("customerBin") or "",
+        "supplier_name": raw.get("supplier_name") or raw.get("supplierNameRu") or "",
+        "supplier_biin": raw.get("supplier_biin") or raw.get("supplierBin") or "",
+        "lot_number": raw.get("lot_number") or raw.get("lotNumber") or "",
+        "number_anno": number_anno,
+        "contract_number": raw.get("contract_number") or "",
+        "status": status,
         "lot_url": build_lot_url(str(number_anno or ""), trd_buy_id, lot_id),
         "raw": raw,
     }

@@ -93,7 +93,7 @@ def match_product(name: str, description: str = "") -> Optional[str]:
     if not scores:
         return None
     winner_key, winner_score = max(scores.items(), key=lambda x: x[1])
-    if winner_score < 30:
+    if winner_score < 25:
         return None
     return winner_key
 
