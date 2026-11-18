@@ -463,6 +463,184 @@ class GoszakupClient:
                     break
         return out
 
+
+    _CONTRACT_QUERY = """
+    query($limit: Int, $filter: ContractFiltersInput) {
+      Contract(limit: $limit, filter: $filter) {
+        id
+        trdBuyId
+        trdBuyNumberAnno
+        contractNumber
+        contractNumberSys
+        supplierId
+        supplierBiin
+        customerBin
+        Supplier {
+          id
+          bin
+          nameRu
+          nameKz
+        }
+      }
+    }
+    """
+
+    def fetch_supplier_by_trd_buy(
+        self,
+        trd_buy_id: Any = None,
+        number_anno: str = "",
+    ) -> Dict[str, str]:
+        """БИН и название поставщика из договора (реестр Contract)."""
+        out = {"supplier_name": "", "supplier_biin": "", "contract_number": ""}
+
+        if trd_buy_id:
+            try:
+                tid = int(trd_buy_id)
+                data = self._graphql(
+                    self._CONTRACT_QUERY,
+                    {"limit": 5, "filter": {"trdBuyId": [tid]}},
+                )
+                items = data.get("Contract") or data.get("contract") or []
+                if items:
+                    c = items[0]
+                    biin = c.get("supplierBiin") or ""
+                    name = ""
+                    sup = c.get("Supplier") or {}
+                    if isinstance(sup, dict):
+                        name = sup.get("nameRu") or sup.get("nameKz") or ""
+                        biin = biin or sup.get("bin") or ""
+                    out["supplier_biin"] = str(biin or "")
+                    out["supplier_name"] = str(name or "")
+                    out["contract_number"] = str(
+                        c.get("contractNumberSys")
+                        or c.get("contractNumber")
+                        or ""
+                    )
+                    if out["supplier_biin"] or out["supplier_name"]:
+                        return out
+            except Exception:
+                pass
+
+        if trd_buy_id:
+            for path in ("/v3/contract", "/v2/contract", "/contract"):
+                try:
+                    data = self._get(path, {
+                        "limit": 10,
+                        "trd_buy_id": trd_buy_id,
+                    })
+                    items = data.get("items") or data.get("data") or []
+                    if not items and isinstance(data, dict) and data.get("id"):
+                        items = [data]
+                    for c in items:
+                        biin = (
+                            c.get("supplier_biin")
+                            or c.get("supplierBiin")
+                            or ""
+                        )
+                        if not biin and not c.get("supplier_id"):
+                            continue
+                        out["supplier_biin"] = str(biin or "")
+                        out["contract_number"] = str(
+                            c.get("contract_number_sys")
+                            or c.get("contractNumberSys")
+                            or c.get("contract_number")
+                            or ""
+                        )
+                        if out["supplier_biin"] and not out["supplier_name"]:
+                            out["supplier_name"] = self._subject_name(
+                                out["supplier_biin"]
+                            )
+                        if out["supplier_biin"] or out["supplier_name"]:
+                            return out
+                except GoszakupAPIError:
+                    continue
+
+        if number_anno:
+            for path in ("/v3/contract", "/v2/contract"):
+                try:
+                    data = self._get(path, {
+                        "limit": 10,
+                        "trd_buy_number_anno": number_anno,
+                    })
+                    items = data.get("items") or data.get("data") or []
+                    for c in items:
+                        biin = c.get("supplier_biin") or c.get("supplierBiin") or ""
+                        if not biin:
+                            continue
+                        out["supplier_biin"] = str(biin)
+                        out["contract_number"] = str(
+                            c.get("contract_number_sys")
+                            or c.get("contract_number")
+                            or ""
+                        )
+                        out["supplier_name"] = self._subject_name(out["supplier_biin"])
+                        if out["supplier_biin"]:
+                            return out
+                except GoszakupAPIError:
+                    continue
+        return out
+
+    def _subject_name(self, biin: str) -> str:
+        if not biin:
+            return ""
+        for path in (
+            f"/v3/subject/biin/{biin}",
+            f"/v2/subject/biin/{biin}",
+            f"/subject/biin/{biin}",
+        ):
+            try:
+                data = self._get(path)
+                if isinstance(data, dict):
+                    items = data.get("items") or data.get("data")
+                    if items and isinstance(items, list):
+                        data = items[0]
+                    name = (
+                        data.get("name_ru")
+                        or data.get("nameRu")
+                        or data.get("full_name_ru")
+                        or data.get("name")
+                        or ""
+                    )
+                    if name:
+                        return str(name)
+            except GoszakupAPIError:
+                continue
+        return ""
+
+    def enrich_with_suppliers(
+        self,
+        rows: List[Dict[str, Any]],
+        progress: ProgressCb = None,
+    ) -> List[Dict[str, Any]]:
+        """Дополняет строки БИН/названием поставщика из договоров."""
+        if not rows:
+            return rows
+        cb = progress or _default_progress
+        cache: Dict[str, Dict[str, str]] = {}
+        total = len(rows)
+        for i, row in enumerate(rows):
+            if row.get("supplier_biin") and row.get("supplier_name"):
+                continue
+            trd_id = row.get("trd_buy_id")
+            if not trd_id:
+                raw = row.get("raw") or {}
+                trd_id = raw.get("trd_buy_id") or raw.get("trdBuyId")
+            anno = str(row.get("number_anno") or "")
+            key = f"id:{trd_id}" if trd_id else f"anno:{anno}"
+            if key not in cache:
+                cache[key] = self.fetch_supplier_by_trd_buy(trd_id, anno)
+                time.sleep(API_PAUSE_SEC)
+            info = cache[key]
+            if info.get("supplier_biin") and not row.get("supplier_biin"):
+                row["supplier_biin"] = info["supplier_biin"]
+            if info.get("supplier_name") and not row.get("supplier_name"):
+                row["supplier_name"] = info["supplier_name"]
+            if info.get("contract_number") and not row.get("contract_number"):
+                row["contract_number"] = info["contract_number"]
+            if i % 3 == 0 or i + 1 == total:
+                cb("Поставщик (договор)", i + 1, total)
+        return rows
+
     def get_lot(self, lot_id: int | str) -> Dict[str, Any]:
         for path in (f"/v3/lots/{lot_id}", f"/v2/lots/{lot_id}", f"/lots/{lot_id}"):
             try:
@@ -577,10 +755,22 @@ def normalize_lot(raw: Dict[str, Any]) -> Dict[str, Any]:
             or ""
         ),
         "customer_bin": raw.get("customer_bin") or raw.get("customerBin") or "",
-        "supplier_name": raw.get("supplier_name") or raw.get("supplierNameRu") or "",
-        "supplier_biin": raw.get("supplier_biin") or raw.get("supplierBin") or "",
+        "supplier_name": (
+            raw.get("supplier_name")
+            or raw.get("supplierNameRu")
+            or raw.get("supplier_name_ru")
+            or ""
+        ),
+        "supplier_biin": (
+            raw.get("supplier_biin")
+            or raw.get("supplierBiin")
+            or raw.get("supplierBin")
+            or raw.get("supplier_bin")
+            or ""
+        ),
         "lot_number": raw.get("lot_number") or raw.get("lotNumber") or "",
         "number_anno": number_anno,
+        "trd_buy_id": trd_buy_id,
         "contract_number": raw.get("contract_number") or "",
         "status": status,
         "lot_url": build_lot_url(str(number_anno or ""), trd_buy_id, lot_id),

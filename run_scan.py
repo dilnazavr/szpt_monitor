@@ -61,7 +61,7 @@ def parse_args():
     p.add_argument("--mode", choices=("fast", "full"), default="full",
                    help="full=нормальный полный поиск; fast=ускоренный")
     p.add_argument("--max-pages", type=int, default=0,
-                   help="Лимит страниц (0=без лимита)")
+                   help="Стр. на слово СЗПТ (рекоменд. 4–8; 0=по умолчанию 6)")
     return p.parse_args()
 
 
@@ -133,6 +133,14 @@ def main():
     print(f"Имеют эталон (по дате): {stats['has_etalon']}")
     print(f"Выше порога {args.threshold}%: {stats['above_threshold']}")
     print(f"Пропущено (нет qty): {stats['skipped_no_qty']}")
+
+    # БИН и название поставщика — из реестра договоров
+    if results:
+        write_progress("Поставщик (договор)", 0, len(results))
+        print("\nЗагрузка поставщиков из договоров…")
+        results = client.enrich_with_suppliers(results, progress=progress_cb)
+        filled = sum(1 for r in results if r.get("supplier_biin") or r.get("supplier_name"))
+        print(f"Поставщик заполнен: {filled}/{len(results)}")
 
     out_path = Path(args.output) if args.output else (
         OUTPUT_DIR / f"zavysheniya_{datetime.now():%Y%m%d_%H%M}.xlsx"

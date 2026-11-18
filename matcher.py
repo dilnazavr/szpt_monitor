@@ -180,6 +180,7 @@ def process_lots(
             "customer_bin": lot.get("customer_bin") or "",
             "supplier_name": lot.get("supplier_name") or "",
             "supplier_biin": lot.get("supplier_biin") or "",
+            "trd_buy_id": lot.get("trd_buy_id") or "",
             "lot_number": lot.get("lot_number") or "",
             "number_anno": lot.get("number_anno") or "",
             "contract_number": lot.get("contract_number") or "",
